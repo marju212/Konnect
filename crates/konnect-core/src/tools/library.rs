@@ -4554,14 +4554,28 @@ async fn handle_delete_symbol(
 
     let content = tokio::fs::read_to_string(&lib_path).await?;
 
-    // Find `  (symbol "NAME"` block
-    let pat = format!(r#"  (symbol "{}""#, symbol_name);
-    let start = content
-        .find(&pat)
+    // Find the top-level `(symbol "NAME"` block. KiCad 8 indented it with two
+    // spaces, KiCad 9 and 10 write a tab, and a hand-edited file may use
+    // either, so the token is matched at the start of a line after any run of
+    // blanks. The closing quote is part of the token, which keeps a unit
+    // block (`(symbol "NAME_1_1"`) from matching its parent's name.
+    let token = format!(r#"(symbol "{}""#, symbol_name);
+    let mut search_from = 0;
+    let mut found = None;
+    while let Some(offset) = content[search_from..].find(&token) {
+        let at = search_from + offset;
+        let line_start = content[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        if content[line_start..at]
+            .chars()
+            .all(|ch| ch == ' ' || ch == '\t')
+        {
+            found = Some((line_start, at));
+            break;
+        }
+        search_from = at + token.len();
+    }
+    let (block_start, start) = found
         .ok_or_else(|| anyhow::anyhow!("Symbol '{}' not found in library", symbol_name))?;
-
-    // Walk back to find preceding newline
-    let block_start = content[..start].rfind('\n').map(|i| i + 1).unwrap_or(start);
 
     // Walk forward to find end of block (depth count)
     let mut depth = 0i32;
@@ -4579,8 +4593,10 @@ async fn handle_delete_symbol(
             _ => {}
         }
     }
-    // Skip trailing newline
-    let end = if content[end..].starts_with('\n') {
+    // Skip the trailing line break, CRLF or LF, so no blank line is left behind.
+    let end = if content[end..].starts_with("\r\n") {
+        end + 2
+    } else if content[end..].starts_with('\n') {
         end + 1
     } else {
         end

@@ -4210,6 +4210,26 @@ impl KiCadIpcClient {
         // Target the document matching `board`, not whichever board is first
         // in KiCad's open list — with several boards open, first-document
         // targeting mutates the wrong one (caught in live verification).
+        let item = Self::build_footprint_item(
+            lib_id, reference, value, pads, graphics, fields, x, y, rotation, layer,
+        )?;
+        self.place_footprint_item(board, reference, item)
+    }
+
+    /// Place an already built `FootprintInstance` item and verify it landed.
+    ///
+    /// Split from [`Self::place_footprint`] so a caller can give the built
+    /// item what [`Self::build_footprint_item`] does not know about — the
+    /// library's attributes, 3D models and net-tie groups — before it is sent.
+    pub fn place_footprint_item(
+        &self,
+        board: &Path,
+        reference: &str,
+        item: prost_types::Any,
+    ) -> Result<IpcFootprint> {
+        // Target the document matching `board`, not whichever board is first
+        // in KiCad's open list — with several boards open, first-document
+        // targeting mutates the wrong one (caught in live verification).
         let document = self.find_open_board(board)?;
         if self
             .list_footprints_in(document.clone())?
@@ -4218,9 +4238,6 @@ impl KiCadIpcClient {
         {
             anyhow::bail!("footprint reference '{reference}' already exists on the board");
         }
-        let item = Self::build_footprint_item(
-            lib_id, reference, value, pads, graphics, fields, x, y, rotation, layer,
-        )?;
         self.create_items_in(document.clone(), vec![item])?;
         let footprints = self.list_footprints_in(document)?;
         footprints

@@ -85,6 +85,33 @@ struct DesignComponent {
     symbol_path: String,
     dnp: bool,
     pad_nets: BTreeMap<String, String>,
+    symbol_fields: SymbolFields,
+}
+
+/// What the schematic says about a part beyond its reference, value, DNP and
+/// pad nets, and what KiCad's own *Update PCB from Schematic* pushes to the
+/// board as well: the BOM exclusion, and the text of every field but
+/// Reference, Value and Footprint (Datasheet, Description, and user fields
+/// such as an LCSC part number). Without them a synced board failed DRC's
+/// schematic parity with a `footprint_symbol_field_mismatch` per field.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+struct SymbolFields {
+    exclude_from_bom: bool,
+    /// Field name → text, in name order so the plan hash is stable.
+    fields: BTreeMap<String, String>,
+}
+
+impl SymbolFields {
+    /// Whether the board's copy disagrees with the schematic on anything the
+    /// schematic states. A field the board alone carries is the instance's
+    /// own and is not a difference.
+    fn differs_from_board(&self, board: &SymbolFields) -> bool {
+        self.exclude_from_bom != board.exclude_from_bom
+            || self
+                .fields
+                .iter()
+                .any(|(name, text)| board.fields.get(name) != Some(text))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
@@ -118,6 +145,10 @@ struct BoardFootprint {
     locked: bool,
     dnp: bool,
     not_in_schematic: bool,
+    /// The BOM exclusion and field texts the live footprint carries, read the
+    /// same way the schematic's are, so the planner can tell when the
+    /// schematic's fields have not reached the board.
+    symbol_fields: SymbolFields,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -174,6 +205,7 @@ enum PlannedChange {
         symbol_path: String,
         dnp: bool,
         pad_nets: BTreeMap<String, String>,
+        symbol_fields: SymbolFields,
         position: Point,
     },
     Update {
@@ -183,6 +215,7 @@ enum PlannedChange {
         symbol_path: String,
         dnp: bool,
         pad_nets: BTreeMap<String, String>,
+        symbol_fields: SymbolFields,
         preserve: PreservedBoardState,
     },
 }
@@ -289,6 +322,10 @@ struct PreparedFootprint {
     /// footprint definition.
     description_and_keywords: konnect_ipc::gen::kiapi::board::types::FootprintAttributes,
     models: Vec<konnect_ipc::gen::kiapi::board::types::Footprint3DModel>,
+    /// `(net_tie_pad_groups …)`: pads copper may join without a short.
+    net_ties: Vec<konnect_ipc::gen::kiapi::board::types::NetTieDefinition>,
+    /// The footprint-level `(zone_connect …)`, `None` when inherited.
+    zone_connection: Option<konnect_ipc::gen::kiapi::board::types::ZoneConnectionStyle>,
     width: f64,
     height: f64,
 }
@@ -765,6 +802,7 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
                 symbol_path: component.symbol_path.clone(),
                 dnp: component.dnp,
                 pad_nets: component.pad_nets.clone(),
+                symbol_fields: component.symbol_fields.clone(),
                 position,
             });
             counts.added.planned += 1;
@@ -854,6 +892,9 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
             || footprint.value != component.value
             || footprint.symbol_path.as_deref() != Some(component.symbol_path.as_str())
             || footprint.dnp != component.dnp
+            || component
+                .symbol_fields
+                .differs_from_board(&footprint.symbol_fields)
             || changed_pads > 0;
         if needs_update {
             changes.push(PlannedChange::Update {
@@ -863,6 +904,7 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
                 symbol_path: component.symbol_path.clone(),
                 dnp: component.dnp,
                 pad_nets: component.pad_nets.clone(),
+                symbol_fields: component.symbol_fields.clone(),
                 preserve: PreservedBoardState {
                     position: footprint.position,
                     rotation: footprint.rotation,
@@ -1105,6 +1147,35 @@ fn parse_exported_netlist(source: &str) -> Result<ExportedDesign> {
             property.find_str("name") == Some("dnp")
                 || property.get(1).and_then(SexpNode::as_str) == Some("dnp")
         });
+        // kicad-cli writes a symbol excluded from the BOM as a bare
+        // `(property (name "exclude_from_bom"))`, like `dnp`, and lists every
+        // field as `(field (name "X") "text")` under `(fields …)`, an empty
+        // one with no text atom at all.
+        let exclude_from_bom = component_node
+            .find_all("property")
+            .iter()
+            .any(|property| property.find_str("name") == Some("exclude_from_bom"));
+        let mut fields = BTreeMap::new();
+        if let Some(fields_node) = component_node.find("fields") {
+            for field in fields_node.find_all("field") {
+                let Some(name) = field.find_str("name") else {
+                    continue;
+                };
+                if matches!(name, "Reference" | "Value" | "Footprint") {
+                    continue;
+                }
+                let text = field
+                    .get(2)
+                    .and_then(SexpNode::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                fields.insert(name.to_string(), text);
+            }
+        }
+        let symbol_fields = SymbolFields {
+            exclude_from_bom,
+            fields,
+        };
 
         let value = required_value(component_node, "value")?;
         // kicad-cli writes no `(footprint …)` node at all for a symbol whose
@@ -1142,6 +1213,7 @@ fn parse_exported_netlist(source: &str) -> Result<ExportedDesign> {
             symbol_path,
             dnp,
             pad_nets: BTreeMap::new(),
+            symbol_fields,
         });
     }
 
@@ -1203,6 +1275,7 @@ fn update_footprint_item(
         symbol_path,
         dnp,
         pad_nets,
+        symbol_fields,
         ..
     } = change
     else {
@@ -1220,6 +1293,7 @@ fn update_footprint_item(
         value,
         symbol_path,
         *dnp,
+        symbol_fields,
         pad_nets,
         net_codes,
     )?;
@@ -1237,6 +1311,7 @@ fn apply_footprint_fields(
     value: &str,
     symbol_path: &str,
     dnp: bool,
+    symbol_fields: &SymbolFields,
     pad_nets: &BTreeMap<String, String>,
     net_codes: &BTreeMap<String, i32>,
 ) -> Result<()> {
@@ -1269,6 +1344,34 @@ fn apply_footprint_fields(
         .attributes
         .get_or_insert_with(Default::default)
         .do_not_populate = dnp;
+    footprint
+        .attributes
+        .get_or_insert_with(Default::default)
+        .exclude_from_bill_of_materials = symbol_fields.exclude_from_bom;
+    definition
+        .attributes
+        .get_or_insert_with(Default::default)
+        .exclude_from_bill_of_materials = symbol_fields.exclude_from_bom;
+
+    // The schematic's field texts, as KiCad's own update pushes them: the
+    // two first-class fields on both the instance and its definition, every
+    // other field as a hidden typed `Field` item, updated in place when the
+    // board already has one of that name.
+    let anchor = footprint.position.clone();
+    let layer = footprint.layer;
+    for (name, text) in &symbol_fields.fields {
+        match name.as_str() {
+            "Datasheet" => {
+                set_first_class_field(&mut footprint.datasheet_field, name, text, anchor.as_ref(), layer);
+                set_first_class_field(&mut definition.datasheet_field, name, text, anchor.as_ref(), layer);
+            }
+            "Description" => {
+                set_first_class_field(&mut footprint.description_field, name, text, anchor.as_ref(), layer);
+                set_first_class_field(&mut definition.description_field, name, text, anchor.as_ref(), layer);
+            }
+            _ => set_custom_field(definition, reference, name, text, anchor.as_ref(), layer)?,
+        }
+    }
 
     let mut seen_pads = std::collections::HashSet::new();
     for child in &mut definition.items {
@@ -1309,6 +1412,106 @@ fn apply_footprint_fields(
         }
     }
 
+    Ok(())
+}
+
+/// A hidden field on the fabrication layer of the footprint's side, at its
+/// anchor: what KiCad creates for a schematic field the footprint lacks.
+fn hidden_field(
+    name: &str,
+    text: &str,
+    anchor: Option<&konnect_ipc::gen::kiapi::common::types::Vector2>,
+    footprint_layer: i32,
+) -> konnect_ipc::gen::kiapi::board::types::Field {
+    use konnect_ipc::gen::kiapi;
+
+    let fab = if footprint_layer == kiapi::board::types::BoardLayer::BlBCu as i32 {
+        kiapi::board::types::BoardLayer::BlBFab
+    } else {
+        kiapi::board::types::BoardLayer::BlFFab
+    };
+    kiapi::board::types::Field {
+        id: None,
+        name: name.to_string(),
+        text: Some(kiapi::board::types::BoardText {
+            id: None,
+            text: Some(kiapi::common::types::Text {
+                position: anchor.cloned(),
+                attributes: Some(kiapi::common::types::TextAttributes {
+                    size: Some(konnect_ipc::builders::vec2(1.0, 1.0)),
+                    stroke_width: Some(konnect_ipc::builders::distance(0.15)),
+                    ..Default::default()
+                }),
+                text: text.to_string(),
+                hyperlink: String::new(),
+            }),
+            layer: fab as i32,
+            knockout: false,
+            locked: kiapi::common::types::LockedState::LsUnlocked as i32,
+            parent: None,
+        }),
+        visible: false,
+    }
+}
+
+/// Set the text of a first-class field (Datasheet, Description), creating a
+/// hidden one when the footprint has none.
+fn set_first_class_field(
+    field: &mut Option<konnect_ipc::gen::kiapi::board::types::Field>,
+    name: &str,
+    text: &str,
+    anchor: Option<&konnect_ipc::gen::kiapi::common::types::Vector2>,
+    footprint_layer: i32,
+) {
+    match field {
+        Some(field) => {
+            field
+                .text
+                .get_or_insert_with(Default::default)
+                .text
+                .get_or_insert_with(Default::default)
+                .text = text.to_string();
+        }
+        None => *field = Some(hidden_field(name, text, anchor, footprint_layer)),
+    }
+}
+
+/// Set the text of a user field carried as a typed `Field` item of the
+/// definition, updating the one of that name in place or adding a hidden one.
+fn set_custom_field(
+    definition: &mut konnect_ipc::gen::kiapi::board::types::Footprint,
+    reference: &str,
+    name: &str,
+    text: &str,
+    anchor: Option<&konnect_ipc::gen::kiapi::common::types::Vector2>,
+    footprint_layer: i32,
+) -> Result<()> {
+    use konnect_ipc::gen::kiapi;
+
+    for item in &mut definition.items {
+        if !konnect_ipc::builders::any_is(item, "kiapi.board.types.Field") {
+            continue;
+        }
+        let mut field =
+            kiapi::board::types::Field::decode(item.value.as_slice()).with_context(|| {
+                format!("footprint {reference} has a field KiCad sent in a form Konnect cannot read")
+            })?;
+        if field.name != name {
+            continue;
+        }
+        field
+            .text
+            .get_or_insert_with(Default::default)
+            .text
+            .get_or_insert_with(Default::default)
+            .text = text.to_string();
+        *item = konnect_ipc::builders::pack_any(&field, "kiapi.board.types.Field");
+        return Ok(());
+    }
+    definition.items.push(konnect_ipc::builders::pack_any(
+        &hidden_field(name, text, anchor, footprint_layer),
+        "kiapi.board.types.Field",
+    ));
     Ok(())
 }
 
@@ -1657,9 +1860,6 @@ fn apply_saved_symbol_flags(files: &[PathBuf], design: &mut ExportedDesign) -> R
         let Some(entry) = entry else {
             return true;
         };
-        if !entry.in_bom {
-            return false;
-        }
         if !entry.on_board {
             design.skipped.push(SkippedComponent {
                 reference: entry.reference.clone(),
@@ -1667,12 +1867,15 @@ fn apply_saved_symbol_flags(files: &[PathBuf], design: &mut ExportedDesign) -> R
             });
             return false;
         }
+        // A symbol excluded from the BOM still goes on the board, with the
+        // exclusion on its footprint, as KiCad's own update does: a mounting
+        // hole or a solder jumper is on the board and not in the BOM.
+        component.symbol_fields.exclude_from_bom |= !entry.in_bom;
         component.dnp = entry.dnp;
         true
     });
-    // The same flags govern a component with no footprint: excluded from the
-    // BOM it is dropped, excluded from the board it is skipped by flag rather
-    // than reported as unassigned.
+    // The same on-board flag governs a component with no footprint: excluded
+    // from the board it is skipped by flag rather than reported as unassigned.
     design.unassigned.retain(|component| {
         let path_match = flags
             .iter()
@@ -1685,9 +1888,6 @@ fn apply_saved_symbol_flags(files: &[PathBuf], design: &mut ExportedDesign) -> R
         let Some(entry) = entry else {
             return true;
         };
-        if !entry.in_bom {
-            return false;
-        }
         if !entry.on_board {
             design.skipped.push(SkippedComponent {
                 reference: entry.reference.clone(),
@@ -1698,7 +1898,7 @@ fn apply_saved_symbol_flags(files: &[PathBuf], design: &mut ExportedDesign) -> R
         true
     });
     let mut skipped_references = HashSet::new();
-    for entry in flags.iter().filter(|entry| entry.in_bom && !entry.on_board) {
+    for entry in flags.iter().filter(|entry| !entry.on_board) {
         if !skipped_references.insert(entry.reference.as_str()) {
             continue;
         }
@@ -1876,7 +2076,57 @@ fn board_footprint_from_instance(
             .as_ref()
             .map(|attributes| attributes.not_in_schematic)
             .unwrap_or(false),
+        symbol_fields: board_symbol_fields(footprint, definition),
     })
+}
+
+/// The BOM exclusion and field texts a live footprint carries, keyed the way
+/// the netlist keys the schematic's: Datasheet and Description from their
+/// first-class fields, every other field from the typed `Field` items.
+fn board_symbol_fields(
+    footprint: &konnect_ipc::gen::kiapi::board::types::FootprintInstance,
+    definition: &konnect_ipc::gen::kiapi::board::types::Footprint,
+) -> SymbolFields {
+    use konnect_ipc::gen::kiapi;
+
+    let first_class =|instance: &Option<kiapi::board::types::Field>,
+                       definition: &Option<kiapi::board::types::Field>| {
+        if instance.is_some() {
+            field_text(instance)
+        } else {
+            field_text(definition)
+        }
+    };
+    let mut fields = BTreeMap::new();
+    fields.insert(
+        "Datasheet".to_string(),
+        first_class(&footprint.datasheet_field, &definition.datasheet_field),
+    );
+    fields.insert(
+        "Description".to_string(),
+        first_class(&footprint.description_field, &definition.description_field),
+    );
+    for child in &definition.items {
+        if !konnect_ipc::builders::any_is(child, "kiapi.board.types.Field") {
+            continue;
+        }
+        let Ok(field) = kiapi::board::types::Field::decode(child.value.as_slice()) else {
+            continue;
+        };
+        if field.name.is_empty() {
+            continue;
+        }
+        let name = field.name.clone();
+        fields.insert(name, field_text(&Some(field)));
+    }
+    SymbolFields {
+        exclude_from_bom: footprint
+            .attributes
+            .as_ref()
+            .map(|attributes| attributes.exclude_from_bill_of_materials)
+            .unwrap_or(false),
+        fields,
+    }
 }
 
 fn field_text(field: &Option<konnect_ipc::gen::kiapi::board::types::Field>) -> String {
@@ -2004,6 +2254,9 @@ fn prepare_footprint_source(
     let attributes = super::library_footprint::attributes(&root).map_err(unsupported)?;
     let description_and_keywords = super::library_footprint::description_and_keywords(&root);
     let models = super::library_footprint::models(&root).map_err(unsupported)?;
+    let net_ties = super::library_footprint::net_ties(&root).map_err(unsupported)?;
+    let zone_connection =
+        super::library_footprint::zone_connection(&root).map_err(unsupported)?;
     let (width, height) = footprint_dimensions(&pads, &graphics);
     Ok(PreparedFootprint {
         pads,
@@ -2012,6 +2265,8 @@ fn prepare_footprint_source(
         attributes,
         description_and_keywords,
         models,
+        net_ties,
+        zone_connection,
         width,
         height,
     })
@@ -2030,11 +2285,19 @@ fn apply_library_data(
     part: &PreparedFootprint,
 ) -> Result<()> {
     footprint.attributes = Some(part.attributes.clone());
+    if let Some(zone_connection) = part.zone_connection {
+        footprint
+            .overrides
+            .get_or_insert_with(Default::default)
+            .zone_connection = zone_connection as i32;
+    }
     let definition = footprint
         .definition
         .as_mut()
         .context("built footprint has no definition")?;
     definition.attributes = Some(part.description_and_keywords.clone());
+    // Without the net-tie groups a solder jumper's bridge is a DRC short.
+    definition.net_ties = part.net_ties.clone();
     definition.items.extend(
         part.models.iter().map(|model| {
             konnect_ipc::builders::pack_any(model, "kiapi.board.types.Footprint3DModel")
@@ -2233,6 +2496,7 @@ fn build_added_footprint(
         symbol_path,
         dnp,
         pad_nets,
+        symbol_fields,
         position,
     } = change
     else {
@@ -2259,6 +2523,7 @@ fn build_added_footprint(
         value,
         symbol_path,
         *dnp,
+        symbol_fields,
         pad_nets,
         net_codes,
     )?;
@@ -2930,6 +3195,7 @@ mod tests {
                 ("1".to_string(), "VCC".to_string()),
                 ("2".to_string(), "GND".to_string()),
             ]),
+            symbol_fields: SymbolFields::default(),
         }
     }
 
@@ -2951,6 +3217,7 @@ mod tests {
             locked: false,
             dnp: false,
             not_in_schematic: false,
+            symbol_fields: SymbolFields::default(),
         }
     }
 
@@ -2996,6 +3263,7 @@ mod tests {
                     locked: true,
                     dnp: false,
                     not_in_schematic: false,
+                    symbol_fields: SymbolFields::default(),
                 },
                 BoardFootprint {
                     kiid: "board-only".to_string(),
@@ -3011,6 +3279,7 @@ mod tests {
                     locked: true,
                     dnp: false,
                     not_in_schematic: true,
+                    symbol_fields: SymbolFields::default(),
                 },
             ],
             routed_nets: BTreeMap::new(),
@@ -3177,6 +3446,7 @@ mod tests {
             symbol_path: "/root/u1".to_string(),
             dnp: false,
             pad_nets: BTreeMap::from([("1".to_string(), "GND".to_string())]),
+            symbol_fields: SymbolFields::default(),
             preserve: PreservedBoardState {
                 position: Point { x: 25.0, y: 30.0 },
                 rotation: 0.0,
@@ -3227,6 +3497,7 @@ mod tests {
             "NE555",
             "/root/u2",
             false,
+            &SymbolFields::default(),
             &BTreeMap::from([("1".to_string(), "VCC".to_string())]),
             &BTreeMap::from([("VCC".to_string(), 3)]),
         )
@@ -3317,6 +3588,7 @@ mod tests {
             "NE555",
             "/root/u3",
             false,
+            &SymbolFields::default(),
             &BTreeMap::from([("1".to_string(), "VCC".to_string())]),
             &BTreeMap::new(),
         )
@@ -3375,6 +3647,7 @@ mod tests {
             symbol_path: "/root/symbol".to_string(),
             dnp: true,
             pad_nets: BTreeMap::from([("1".to_string(), "VCC".to_string())]),
+            symbol_fields: SymbolFields::default(),
             preserve: PreservedBoardState {
                 position: Point { x: 25.0, y: 30.0 },
                 rotation: 90.0,
@@ -3432,6 +3705,7 @@ mod tests {
                 locked: false,
                 dnp: false,
                 not_in_schematic: false,
+                symbol_fields: SymbolFields::default(),
             }],
             routed_nets: BTreeMap::from([("VCC".to_string(), 1)]),
             bounds: Bounds {
@@ -4512,6 +4786,7 @@ mod tests {
                 .iter()
                 .map(|pad| (pad.to_string(), format!("{reference}-{pad}")))
                 .collect(),
+            symbol_fields: SymbolFields::default(),
             position: Point { x: 0.0, y: 0.0 },
         }
     }
@@ -5543,6 +5818,7 @@ mod tests {
             symbol_path: "/c1-uuid".into(),
             dnp,
             pad_nets: BTreeMap::new(),
+            symbol_fields: SymbolFields::default(),
             position: Point { x: 10.0, y: 10.0 },
         };
         let built_dnp = |part: &PreparedFootprint, dnp: bool| {

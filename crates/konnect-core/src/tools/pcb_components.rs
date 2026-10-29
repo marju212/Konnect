@@ -891,7 +891,48 @@ pub(crate) struct PreparedFootprintPlacement {
     pub(crate) pads: Vec<konnect_ipc::IpcPadDefinition>,
     pub(crate) graphics: Vec<konnect_ipc::IpcGraphicDefinition>,
     pub(crate) fields: konnect_ipc::IpcFieldPlacement,
+    /// The library's attributes, description, 3D models, net-tie groups and
+    /// zone-connection override, which the typed builder does not carry.
+    pub(crate) extras: super::library_footprint::LibraryExtras,
     board_sexp: String,
+}
+
+/// Build the typed `FootprintInstance` item for a placement and give it the
+/// library data the pad/graphic/field builder leaves out. Without this every
+/// footprint placed over IPC reached the board with no mounting style, no
+/// 3D model and no net-tie groups, and DRC flagged all of them as differing
+/// from their library.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_footprint_item_with_extras(
+    lib_id: &str,
+    reference: &str,
+    value: &str,
+    pads: &[konnect_ipc::IpcPadDefinition],
+    graphics: &[konnect_ipc::IpcGraphicDefinition],
+    fields: &konnect_ipc::IpcFieldPlacement,
+    extras: &super::library_footprint::LibraryExtras,
+    x: f64,
+    y: f64,
+    rotation: f64,
+    layer: &str,
+) -> anyhow::Result<prost_types::Any> {
+    let item = KiCadIpcClient::build_footprint_item(
+        lib_id, reference, value, pads, graphics, fields, x, y, rotation, layer,
+    )?;
+    let mut footprint =
+        konnect_ipc::gen::kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+            .context("typed footprint builder returned an invalid item")?;
+    super::library_footprint::apply_extras(&mut footprint, extras)?;
+    Ok(konnect_ipc::builders::pack_any(
+        &footprint,
+        "kiapi.board.types.FootprintInstance",
+    ))
+}
+
+/// The library data of a footprint source that the typed builder leaves out.
+pub(crate) fn library_extras(source: &str) -> anyhow::Result<super::library_footprint::LibraryExtras> {
+    let root = konnect_sexp::parse_sexp(source).context("invalid footprint S-expression")?;
+    super::library_footprint::LibraryExtras::read(&root)
 }
 
 impl PreparedFootprintPlacement {
@@ -912,6 +953,7 @@ impl PreparedFootprintPlacement {
         let pads = extract_pad_definitions(&prepared)?;
         let graphics = extract_graphic_definitions(&prepared)?;
         let fields = extract_field_placement(&prepared);
+        let extras = library_extras(source)?;
         let board_sexp =
             board_footprint_sexp(lib_id, x, y, rotation, layer, Some(reference), project_dir)
                 .map_err(anyhow::Error::msg)?;
@@ -926,6 +968,7 @@ impl PreparedFootprintPlacement {
             pads,
             graphics,
             fields,
+            extras,
             board_sexp,
         })
     }
@@ -942,6 +985,7 @@ impl PreparedFootprintPlacement {
             pads,
             graphics,
             fields,
+            extras: Default::default(),
             board_sexp,
         }
     }
@@ -2237,19 +2281,20 @@ async fn handle_place_component(
     let requested_board = board.clone();
     let prepared_ipc = prepared.clone();
     let attempt = attempt_ipc_write(ctx, &board, "placement", move |c| {
-        c.place_footprint(
-            &requested_board,
+        let item = build_footprint_item_with_extras(
             &footprint_ipc,
             &reference_ipc,
             &prepared_ipc.value,
             &prepared_ipc.pads,
             &prepared_ipc.graphics,
             &prepared_ipc.fields,
+            &prepared_ipc.extras,
             x,
             y,
             rotation,
             &layer_ipc,
-        )
+        )?;
+        c.place_footprint_item(&requested_board, &reference_ipc, item)
     })
     .await?;
 
@@ -3685,6 +3730,10 @@ async fn handle_place_array(
         Err(error) => return Ok(CallToolResult::error(error.to_string())),
     };
     let fields = extract_field_placement(&source);
+    let extras = match library_extras(&source) {
+        Ok(extras) => extras,
+        Err(error) => return Ok(CallToolResult::error(error.to_string())),
+    };
 
     let value = footprint
         .split_once(':')
@@ -3733,13 +3782,14 @@ async fn handle_place_array(
         let items = planned
             .iter()
             .map(|(reference, pads, x, y)| {
-                KiCadIpcClient::build_footprint_item(
+                build_footprint_item_with_extras(
                     &footprint_id,
                     reference,
                     &value,
                     pads,
                     &graphics,
                     &fields,
+                    &extras,
                     *x,
                     *y,
                     0.0,
@@ -3900,20 +3950,27 @@ async fn handle_duplicate_component(
         Err(error) => return Ok(CallToolResult::error(error.to_string())),
     };
     let fields = extract_field_placement(&prepared);
+    let extras = match library_extras(&source) {
+        Ok(extras) => extras,
+        Err(error) => return Ok(CallToolResult::error(error.to_string())),
+    };
     let dup_board = board.clone();
-    let fp = ipc!(ctx, args, |c| c.place_footprint(
-        &dup_board,
-        &fp_id,
-        &ipc_reference,
-        &fp_value,
-        &pads,
-        &graphics,
-        &fields,
-        x,
-        y,
-        fp_rotation,
-        &fp_layer
-    ));
+    let fp = ipc!(ctx, args, |c| {
+        let item = build_footprint_item_with_extras(
+            &fp_id,
+            &ipc_reference,
+            &fp_value,
+            &pads,
+            &graphics,
+            &fields,
+            &extras,
+            x,
+            y,
+            fp_rotation,
+            &fp_layer,
+        )?;
+        c.place_footprint_item(&dup_board, &ipc_reference, item)
+    });
     Ok(CallToolResult::json(&json!({
         "duplicated_from": reference,
         "new_reference": fp.reference,

@@ -24,6 +24,10 @@ struct LibraryFootprint {
     pads: Vec<konnect_ipc::IpcPadDefinition>,
     graphics: Vec<konnect_ipc::IpcGraphicDefinition>,
     models: Vec<kiapi::board::types::Footprint3DModel>,
+    /// `(net_tie_pad_groups …)`: pads copper may join without a short.
+    net_ties: Vec<kiapi::board::types::NetTieDefinition>,
+    /// The footprint-level `(zone_connect …)`, `None` when inherited.
+    zone_connection: Option<kiapi::board::types::ZoneConnectionStyle>,
 }
 
 #[derive(Debug)]
@@ -748,12 +752,15 @@ fn parse_library_footprint(library_id: &str, source: &str) -> Result<LibraryFoot
     let graphics = super::pcb_components::extract_graphic_definitions_without_properties(source)?;
     let models = super::library_footprint::models(&root)?;
     let attributes = super::library_footprint::attributes(&root)?;
+    let net_ties = super::library_footprint::net_ties(&root)?;
+    let zone_connection = super::library_footprint::zone_connection(&root)?;
     let definition = kiapi::board::types::Footprint {
         id: Some(kiapi::common::types::LibraryIdentifier {
             library_nickname: library_nickname.to_string(),
             entry_name: entry_name.to_string(),
         }),
         attributes: Some(super::library_footprint::description_and_keywords(&root)),
+        net_ties: net_ties.clone(),
         ..Default::default()
     };
 
@@ -767,6 +774,8 @@ fn parse_library_footprint(library_id: &str, source: &str) -> Result<LibraryFoot
         pads,
         graphics,
         models,
+        net_ties,
+        zone_connection,
     })
 }
 
@@ -833,6 +842,7 @@ fn parse_library_property(
     let mut layer = None;
     let mut hidden = None;
     let mut knockout = None;
+    let mut unlocked = None;
     let mut attributes = None;
     let mut identifier = None;
 
@@ -913,6 +923,16 @@ fn parse_library_property(
                 }
                 attributes = Some(parse_property_effects(clause, name)?);
             }
+            // KiCad writes `(unlocked yes)` on a footprint text whose
+            // orientation is not kept upright with the footprint; every
+            // hidden Datasheet and Description property in its libraries
+            // carries it. It is the inverse of the API's `keep_upright`.
+            "unlocked" => {
+                if unlocked.is_some() {
+                    bail!("property '{name}' contains duplicate 'unlocked' clauses");
+                }
+                unlocked = Some(property_yes_no(clause, name, "unlocked")?);
+            }
             unsupported => {
                 bail!("property '{name}' clause '{unsupported}' is not supported losslessly")
             }
@@ -932,6 +952,9 @@ fn parse_library_property(
     attributes.angle = Some(kiapi::common::types::Angle {
         value_degrees: rotation,
     });
+    if let Some(unlocked) = unlocked {
+        attributes.keep_upright = !unlocked;
+    }
     Ok(Some(kiapi::board::types::Field {
         id: None,
         name: name.to_string(),
@@ -1142,6 +1165,10 @@ fn validate_supported_children(root: &konnect_sexp::SexpNode) -> Result<()> {
             "version" | "generator" | "generator_version" | "layer" | "descr" | "tags" | "attr"
             | "property" | "fp_text" | "fp_line" | "fp_rect" | "fp_circle" | "fp_arc"
             | "fp_poly" | "pad" | "model" => {}
+            // Both are read by `library_footprint` into typed messages: the
+            // net-tie pad groups of a solder jumper, and the footprint-level
+            // zone connection a jumper or a test pad sets.
+            "net_tie_pad_groups" | "zone_connect" => {}
             // KiCad 10 writes these two flags into every footprint it saves
             // (all 15,428 official library files carry them, every one at its
             // default). At the default the typed rebuild loses nothing;
@@ -1555,6 +1582,7 @@ fn build_updated_instance(
         .definition
         .context("typed footprint builder returned no definition")?;
     definition.attributes = library.definition.attributes.clone();
+    definition.net_ties = library.net_ties.clone();
     definition.reference_field = current_definition.reference_field.clone();
     definition.value_field = current_definition.value_field.clone();
     definition.datasheet_field = current_definition.datasheet_field.clone();
@@ -1618,6 +1646,15 @@ fn build_updated_instance(
         attributes.do_not_populate = current_attributes.do_not_populate;
     }
     updated.attributes = Some(attributes);
+    // A library zone-connection override replaces the instance's, the way
+    // KiCad's own refresh copies it. A library without one leaves the
+    // instance's overrides alone.
+    if let Some(zone_connection) = library.zone_connection {
+        updated
+            .overrides
+            .get_or_insert_with(Default::default)
+            .zone_connection = zone_connection as i32;
+    }
 
     let changed_domains = changed_domains(current, &updated)?;
     let preserved = PreservedState::derive(current, &updated, &old_nets);
@@ -2797,13 +2834,13 @@ mod tests {
     fn parser_names_unrepresentable_or_ambiguous_custom_properties() {
         let unsupported = KICAD_LIBRARY_FOOTPRINT.replace(
             "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(at",
-            "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(unlocked yes)\n\t\t(at",
+            "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(unknown_clause yes)\n\t\t(at",
         );
         assert_ne!(unsupported, KICAD_LIBRARY_FOOTPRINT);
         let error = parse_library_footprint("Test:Socket", &unsupported).unwrap_err();
         let message = error.to_string();
         assert!(message.contains("AssemblyVendor"), "{message}");
-        assert!(message.contains("unlocked"), "{message}");
+        assert!(message.contains("unknown_clause"), "{message}");
 
         let duplicate = KICAD_LIBRARY_FOOTPRINT.replace(
             "\"KiLib_Generator\" \"konnect_test_generator\"",
@@ -2828,7 +2865,7 @@ mod tests {
             let authored = format!("\t(property \"{name}\" \"{value}\"\n\t\t(at");
             let unsupported = KICAD_LIBRARY_FOOTPRINT.replace(
                 &authored,
-                &format!("\t(property \"{name}\" \"{value}\"\n\t\t(unlocked yes)\n\t\t(at"),
+                &format!("\t(property \"{name}\" \"{value}\"\n\t\t(unknown_clause yes)\n\t\t(at"),
             );
             assert_ne!(unsupported, KICAD_LIBRARY_FOOTPRINT);
             match parse_library_footprint("Test:Socket", &unsupported) {
@@ -2836,7 +2873,7 @@ mod tests {
                 Err(error) => {
                     let message = error.to_string();
                     assert!(message.contains(name), "{message}");
-                    assert!(message.contains("unlocked"), "{message}");
+                    assert!(message.contains("unknown_clause"), "{message}");
                 }
             }
 
@@ -3194,7 +3231,7 @@ mod tests {
         let (temp, board, items) = plan_fixture();
         let unsupported = KICAD_LIBRARY_FOOTPRINT.replace(
             "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(at",
-            "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(unlocked yes)\n\t\t(at",
+            "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(unknown_clause yes)\n\t\t(at",
         );
         std::fs::write(
             temp.path().join("Test.pretty/Socket.kicad_mod"),
@@ -3216,7 +3253,7 @@ mod tests {
         assert!(plan.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == "unsupported_library_footprint"
                 && diagnostic.message.contains("AssemblyVendor")
-                && diagnostic.message.contains("unlocked")
+                && diagnostic.message.contains("unknown_clause")
         }));
     }
 
