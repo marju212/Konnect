@@ -139,6 +139,10 @@ struct BoardFootprint {
     /// Every pad the live footprint has, netted or not. `pad_nets` holds only
     /// pads that carry a net, so it cannot answer whether a pad exists.
     pad_numbers: BTreeSet<String>,
+    /// Where each pad sits on the board and how far its copper reaches, so a
+    /// pad-net change can be judged by the copper that actually touches it.
+    /// Empty when the footprint was not read from a live board.
+    pad_reach: Vec<PadReach>,
     position: Point,
     rotation: f64,
     layer: String,
@@ -157,7 +161,73 @@ struct BoardState {
     /// Net name to the number of routed copper objects (tracks, arcs, vias,
     /// and zones) carrying the net.
     routed_nets: BTreeMap<String, usize>,
+    /// The routed copper itself, when it was read from a live board. Without
+    /// it a pad on a routed net cannot change net at all (the coarse rule).
+    copper: Option<RoutedCopper>,
     bounds: Bounds,
+}
+
+/// One pad's centre and the radius its copper reaches (the half diagonal of
+/// its largest copper shape, so a touch is never missed).
+#[derive(Debug, Clone, PartialEq)]
+struct PadReach {
+    number: String,
+    at: Point,
+    radius: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum CopperPiece {
+    Segment { a: Point, b: Point, half_width: f64 },
+    Disc { at: Point, radius: f64 },
+}
+
+/// Tracks, arcs and vias by net, and the nets that carry a copper zone.
+#[derive(Debug, Clone, PartialEq, Default)]
+struct RoutedCopper {
+    pieces: BTreeMap<String, Vec<CopperPiece>>,
+    zone_nets: BTreeSet<String>,
+    /// A copper zone whose net could not be read: every net may be poured.
+    zone_net_unknown: bool,
+}
+
+impl RoutedCopper {
+    /// Whether routed copper of `net` reaches any pad of `footprint` numbered
+    /// `number`. A pad Konnect has no geometry for counts as touched.
+    fn touches_pad(&self, footprint: &BoardFootprint, number: &str, net: &str) -> bool {
+        let pads: Vec<&PadReach> = footprint.pad_reach.iter().filter(|pad| pad.number == number).collect();
+        if pads.is_empty() {
+            return true;
+        }
+        let Some(pieces) = self.pieces.get(net) else {
+            return false;
+        };
+        pads.iter().any(|pad| {
+            pieces.iter().any(|piece| match piece {
+                CopperPiece::Segment { a, b, half_width } => {
+                    point_segment_distance(&pad.at, a, b) <= pad.radius + half_width + 0.01
+                }
+                CopperPiece::Disc { at, radius } => {
+                    ((pad.at.x - at.x).powi(2) + (pad.at.y - at.y).powi(2)).sqrt() <= pad.radius + radius + 0.01
+                }
+            })
+        })
+    }
+
+    fn poured(&self, net: &str) -> bool {
+        self.zone_net_unknown || self.zone_nets.contains(net)
+    }
+}
+
+fn point_segment_distance(p: &Point, a: &Point, b: &Point) -> f64 {
+    let (vx, vy) = (b.x - a.x, b.y - a.y);
+    let len2 = vx * vx + vy * vy;
+    let t = if len2 == 0.0 {
+        0.0
+    } else {
+        (((p.x - a.x) * vx + (p.y - a.y) * vy) / len2).clamp(0.0, 1.0)
+    };
+    ((p.x - a.x - t * vx).powi(2) + (p.y - a.y - t * vy).powi(2)).sqrt()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -874,7 +944,19 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
             if old_net == new_net {
                 continue;
             }
-            if board.routed_nets.contains_key(old_net) || board.routed_nets.contains_key(new_net) {
+            // With the live copper in hand, only copper of the old net that
+            // reaches this very pad (or a pour on either net) blocks the
+            // change: KiCad itself reassigns pads freely, and a pad no track
+            // touches strands nothing. Without it, any routed net blocks.
+            let blocked = match &board.copper {
+                Some(copper) => {
+                    copper.poured(old_net)
+                        || copper.poured(new_net)
+                        || (!old_net.is_empty() && copper.touches_pad(footprint, number, old_net))
+                }
+                None => board.routed_nets.contains_key(old_net) || board.routed_nets.contains_key(new_net),
+            };
+            if blocked {
                 diagnostics.push(conflict(
                     "routed_pad_net_change",
                     format!(
@@ -1939,19 +2021,58 @@ fn snapshot_board(client: &konnect_ipc::KiCadIpcClient, board: &Path) -> Result<
         .map(|net| (net.name.clone(), net.netcode))
         .collect::<BTreeMap<_, _>>();
     let mut routed_nets = BTreeMap::new();
+    let mut copper = RoutedCopper::default();
+    let mm = |v: Option<&kiapi::common::types::Vector2>| {
+        v.map(|v| Point {
+            x: konnect_ipc::builders::nm_to_mm(v.x_nm),
+            y: konnect_ipc::builders::nm_to_mm(v.y_nm),
+        })
+    };
+    let net_of = |net: Option<&kiapi::board::types::Net>| {
+        net.map(|net| net.name.clone()).filter(|name| !name.is_empty())
+    };
     for item in client.get_items_in(document.clone(), ObjectType::KotPcbTrace)? {
+        // KOT_PCB_TRACE also lists vias and arcs: decode by declared type.
+        if !konnect_ipc::builders::any_is(&item, "kiapi.board.types.Track") {
+            continue;
+        }
         if let Ok(track) = kiapi::board::types::Track::decode(item.value.as_slice()) {
             record_routed_net(&mut routed_nets, track.net.as_ref());
+            if let (Some(net), Some(a), Some(b)) = (net_of(track.net.as_ref()), mm(track.start.as_ref()), mm(track.end.as_ref())) {
+                let half_width = track.width.as_ref().map(|w| konnect_ipc::builders::nm_to_mm(w.value_nm) / 2.0).unwrap_or(0.0);
+                copper.pieces.entry(net).or_default().push(CopperPiece::Segment { a, b, half_width });
+            }
         }
     }
     for item in client.get_items_in(document.clone(), ObjectType::KotPcbArc)? {
+        if !konnect_ipc::builders::any_is(&item, "kiapi.board.types.Arc") {
+            continue;
+        }
         if let Ok(arc) = kiapi::board::types::Arc::decode(item.value.as_slice()) {
             record_routed_net(&mut routed_nets, arc.net.as_ref());
+            if let (Some(net), Some(a), Some(m), Some(b)) = (net_of(arc.net.as_ref()), mm(arc.start.as_ref()), mm(arc.mid.as_ref()), mm(arc.end.as_ref())) {
+                let half_width = arc.width.as_ref().map(|w| konnect_ipc::builders::nm_to_mm(w.value_nm) / 2.0).unwrap_or(0.0);
+                let pieces = copper.pieces.entry(net).or_default();
+                pieces.push(CopperPiece::Segment { a: a.clone(), b: m.clone(), half_width });
+                pieces.push(CopperPiece::Segment { a: m, b, half_width });
+            }
         }
     }
     for item in client.get_items_in(document.clone(), ObjectType::KotPcbVia)? {
+        if !konnect_ipc::builders::any_is(&item, "kiapi.board.types.Via") {
+            continue;
+        }
         if let Ok(via) = kiapi::board::types::Via::decode(item.value.as_slice()) {
             record_routed_net(&mut routed_nets, via.net.as_ref());
+            if let (Some(net), Some(at)) = (net_of(via.net.as_ref()), mm(via.position.as_ref())) {
+                let radius = via
+                    .pad_stack
+                    .as_ref()
+                    .and_then(|stack| stack.copper_layers.iter().filter_map(|layer| layer.size.as_ref()).next())
+                    .map(|size| konnect_ipc::builders::nm_to_mm(size.x_nm.max(size.y_nm)) / 2.0)
+                    .unwrap_or(0.5);
+                copper.pieces.entry(net).or_default().push(CopperPiece::Disc { at, radius });
+            }
         }
     }
     // A copper zone carries its net in `copper_settings`; a rule area has
@@ -1966,10 +2087,14 @@ fn snapshot_board(client: &konnect_ipc::KiCadIpcClient, board: &Path) -> Result<
         };
         match zone_copper_net(&zone) {
             ZoneNet::RuleArea => {}
-            ZoneNet::Net(net) => record_routed_net(&mut routed_nets, Some(net)),
+            ZoneNet::Net(net) => {
+                copper.zone_nets.insert(net.name.clone());
+                record_routed_net(&mut routed_nets, Some(net));
+            }
             ZoneNet::Unknown => zone_net_unknown = true,
         }
     }
+    copper.zone_net_unknown = zone_net_unknown;
     if zone_net_unknown {
         for net in net_codes.keys() {
             *routed_nets.entry(net.clone()).or_insert(0) += 1;
@@ -1989,6 +2114,7 @@ fn snapshot_board(client: &konnect_ipc::KiCadIpcClient, board: &Path) -> Result<
         state: BoardState {
             footprints,
             routed_nets,
+            copper: Some(copper),
             bounds: Bounds {
                 min_x: extents.min.x,
                 min_y: extents.min.y,
@@ -2025,6 +2151,7 @@ fn board_footprint_from_instance(
         .context("KiCad returned a footprint without a definition")?;
     let mut pad_nets = BTreeMap::new();
     let mut pad_numbers = BTreeSet::new();
+    let mut pad_reach = Vec::new();
     for child in &definition.items {
         // Same discriminator as `apply_footprint_fields`, for the same
         // reason: a graphic can decode as an empty pad.
@@ -2045,6 +2172,37 @@ fn board_footprint_from_instance(
             continue;
         };
         pad_numbers.insert(pad.number.clone());
+        // IPC reports pad positions in board coordinates (as the pad tools
+        // read them); the reach is the half diagonal of the largest copper
+        // shape on any layer.
+        if let Some(at) = pad.position.as_ref() {
+            let radius = pad
+                .pad_stack
+                .as_ref()
+                .map(|stack| {
+                    stack
+                        .copper_layers
+                        .iter()
+                        .filter_map(|layer| layer.size.as_ref())
+                        .map(|size| {
+                            let (sx, sy) = (
+                                konnect_ipc::builders::nm_to_mm(size.x_nm),
+                                konnect_ipc::builders::nm_to_mm(size.y_nm),
+                            );
+                            (sx * sx + sy * sy).sqrt() / 2.0
+                        })
+                        .fold(0.0_f64, f64::max)
+                })
+                .unwrap_or(0.0);
+            pad_reach.push(PadReach {
+                number: pad.number.clone(),
+                at: Point {
+                    x: konnect_ipc::builders::nm_to_mm(at.x_nm),
+                    y: konnect_ipc::builders::nm_to_mm(at.y_nm),
+                },
+                radius,
+            });
+        }
         if let Some(net) = pad.net.filter(|net| !net.name.is_empty()) {
             pad_nets.insert(pad.number, net.name);
         }
@@ -2062,6 +2220,7 @@ fn board_footprint_from_instance(
         symbol_path: board_symbol_path(footprint.symbol_path.as_ref()),
         pad_nets,
         pad_numbers,
+        pad_reach,
         position: Point {
             x: position
                 .map(|point| konnect_ipc::builders::nm_to_mm(point.x_nm))
@@ -3243,6 +3402,7 @@ mod tests {
                 ("2".to_string(), "GND".to_string()),
             ]),
             pad_numbers: BTreeSet::from(["1".to_string(), "2".to_string()]),
+            pad_reach: Vec::new(),
             position: Point { x: 1.0, y: 2.0 },
             rotation: 0.0,
             layer: "F.Cu".to_string(),
@@ -3257,6 +3417,7 @@ mod tests {
         BoardState {
             footprints,
             routed_nets: BTreeMap::new(),
+            copper: None,
             bounds: Bounds {
                 min_x: 0.0,
                 min_y: 0.0,
@@ -3289,6 +3450,7 @@ mod tests {
                         ("2".to_string(), "GND".to_string()),
                     ]),
                     pad_numbers: BTreeSet::from(["1".to_string(), "2".to_string()]),
+                    pad_reach: Vec::new(),
                     position: Point { x: 25.0, y: 30.0 },
                     rotation: 90.0,
                     layer: "B.Cu".to_string(),
@@ -3305,6 +3467,7 @@ mod tests {
                     symbol_path: None,
                     pad_nets: BTreeMap::new(),
                     pad_numbers: BTreeSet::new(),
+                    pad_reach: Vec::new(),
                     position: Point { x: 2.0, y: 2.0 },
                     rotation: 0.0,
                     layer: "F.Cu".to_string(),
@@ -3315,6 +3478,7 @@ mod tests {
                 },
             ],
             routed_nets: BTreeMap::new(),
+            copper: None,
             bounds: Bounds {
                 min_x: 0.0,
                 min_y: 0.0,
@@ -3712,6 +3876,66 @@ mod tests {
         assert_eq!(pad.net.as_ref().unwrap().code.as_ref().unwrap().value, 7);
     }
 
+    /// R1 at (1, 2) with pad 1 at (0.2, 2) and pad 2 at (1.8, 2), its pad 1
+    /// moving from VCC to BUS in the schematic; `vcc` is the VCC copper.
+    fn pad_move_plan(vcc: Vec<CopperPiece>, zone_nets: &[&str]) -> SyncPlan {
+        let design = ExportedDesign {
+            components: vec![DesignComponent {
+                pad_nets: BTreeMap::from([
+                    ("1".to_string(), "BUS".to_string()),
+                    ("2".to_string(), "GND".to_string()),
+                ]),
+                ..resistor("R1", "/sheet/existing")
+            }],
+            skipped: Vec::new(),
+            unassigned: Vec::new(),
+        };
+        let mut footprint = board_resistor("R1", Some("/sheet/existing"));
+        footprint.pad_reach = vec![
+            PadReach { number: "1".to_string(), at: Point { x: 0.2, y: 2.0 }, radius: 0.6 },
+            PadReach { number: "2".to_string(), at: Point { x: 1.8, y: 2.0 }, radius: 0.6 },
+        ];
+        let mut board = board_with(vec![footprint]);
+        board.routed_nets = BTreeMap::from([("VCC".to_string(), vcc.len())]);
+        board.copper = Some(RoutedCopper {
+            pieces: BTreeMap::from([("VCC".to_string(), vcc)]),
+            zone_nets: zone_nets.iter().map(|net| net.to_string()).collect(),
+            zone_net_unknown: false,
+        });
+        plan_sync("netlist", &design, &board)
+    }
+
+    #[test]
+    fn a_pad_no_copper_touches_may_leave_a_routed_net() {
+        // VCC is routed elsewhere on the board, nowhere near R1's pad 1.
+        let far = vec![CopperPiece::Segment {
+            a: Point { x: 5.0, y: 5.0 },
+            b: Point { x: 9.0, y: 5.0 },
+            half_width: 0.2,
+        }];
+        let plan = pad_move_plan(far, &[]);
+        assert_eq!(plan.status, PlanStatus::Ready, "{:?}", plan.diagnostics);
+        assert!(!plan.diagnostics.iter().any(|d| d.code == "routed_pad_net_change"));
+    }
+
+    #[test]
+    fn copper_reaching_the_pad_still_blocks_the_change() {
+        let track = vec![CopperPiece::Segment {
+            a: Point { x: -3.0, y: 2.0 },
+            b: Point { x: 0.2, y: 2.0 },
+            half_width: 0.2,
+        }];
+        assert_eq!(pad_move_plan(track, &[]).status, PlanStatus::Conflict);
+        let via = vec![CopperPiece::Disc { at: Point { x: 0.2, y: 3.0 }, radius: 0.45 }];
+        assert_eq!(pad_move_plan(via, &[]).status, PlanStatus::Conflict);
+    }
+
+    #[test]
+    fn a_poured_net_on_either_side_blocks_the_change() {
+        assert_eq!(pad_move_plan(Vec::new(), &["BUS"]).status, PlanStatus::Conflict);
+        assert_eq!(pad_move_plan(Vec::new(), &["VCC"]).status, PlanStatus::Conflict);
+    }
+
     #[test]
     fn removing_a_pad_from_a_routed_net_conflicts_the_whole_plan() {
         let design = ExportedDesign {
@@ -3731,6 +3955,7 @@ mod tests {
                 symbol_path: Some("/sheet/existing".to_string()),
                 pad_nets: BTreeMap::from([("1".to_string(), "VCC".to_string())]),
                 pad_numbers: BTreeSet::from(["1".to_string(), "2".to_string()]),
+                pad_reach: Vec::new(),
                 position: Point { x: 1.0, y: 2.0 },
                 rotation: 0.0,
                 layer: "F.Cu".to_string(),
@@ -3740,6 +3965,7 @@ mod tests {
                 symbol_fields: SymbolFields::default(),
             }],
             routed_nets: BTreeMap::from([("VCC".to_string(), 1)]),
+            copper: None,
             bounds: Bounds {
                 min_x: 0.0,
                 min_y: 0.0,
@@ -3914,6 +4140,7 @@ mod tests {
         let board = BoardState {
             footprints: Vec::new(),
             routed_nets: BTreeMap::new(),
+            copper: None,
             bounds: Bounds {
                 min_x: 0.0,
                 min_y: 0.0,
