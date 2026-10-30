@@ -3235,6 +3235,84 @@ impl KiCadIpcClient {
         )
     }
 
+    /// Every text of the placed footprints named in `references` (all
+    /// footprints when empty): fields and plain text items. See
+    /// [`crate::footprint_text`] for the coordinate frames.
+    pub fn list_footprint_texts(&self, references: &[String]) -> Result<Vec<IpcFootprintText>> {
+        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
+        let mut out = Vec::new();
+        let mut seen = BTreeSet::new();
+        for item in &items {
+            let Ok(fp) = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+            else {
+                continue;
+            };
+            let reference = crate::footprint_text::reference_of(&fp).to_string();
+            if !references.is_empty() && !references.contains(&reference) {
+                continue;
+            }
+            seen.insert(reference);
+            out.extend(crate::footprint_text::list_texts(&fp));
+        }
+        if let Some(missing) = references.iter().find(|r| !seen.contains(*r)) {
+            anyhow::bail!("Footprint '{}' not found", missing);
+        }
+        Ok(out)
+    }
+
+    /// Move, rotate, re-layer or hide footprint texts. Every edit is checked
+    /// against the live footprints before anything is sent; then all touched
+    /// footprints go to KiCad in one `UpdateItems`, so the batch is one undo
+    /// step and a refused edit writes nothing. Returns the texts as edited.
+    pub fn edit_footprint_texts(
+        &self,
+        edits: &[IpcFootprintTextEdit],
+    ) -> Result<Vec<IpcFootprintText>> {
+        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
+        let mut footprints: Vec<kiapi::board::types::FootprintInstance> = Vec::new();
+        let mut touched = BTreeSet::new();
+        let mut results = Vec::with_capacity(edits.len());
+        for (i, edit) in edits.iter().enumerate() {
+            let index = match footprints
+                .iter()
+                .position(|fp| crate::footprint_text::reference_of(fp) == edit.reference)
+            {
+                Some(index) => index,
+                None => {
+                    let mut matches = items.iter().filter_map(|item| {
+                        kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+                            .ok()
+                            .filter(|fp| crate::footprint_text::reference_of(fp) == edit.reference)
+                    });
+                    let fp = matches.next().ok_or_else(|| {
+                        anyhow::anyhow!("edit {i}: footprint '{}' not found", edit.reference)
+                    })?;
+                    if matches.next().is_some() {
+                        anyhow::bail!(
+                            "edit {i}: more than one footprint is called '{}'",
+                            edit.reference
+                        );
+                    }
+                    footprints.push(fp);
+                    footprints.len() - 1
+                }
+            };
+            let result = crate::footprint_text::apply_edit(&mut footprints[index], edit)
+                .with_context(|| format!("edit {i} ({})", edit.reference))?;
+            touched.insert(index);
+            results.push(result);
+        }
+        if touched.is_empty() {
+            return Ok(results);
+        }
+        let packed = touched
+            .into_iter()
+            .map(|i| pack_any(&footprints[i], "kiapi.board.types.FootprintInstance"))
+            .collect();
+        self.update_items(packed)?;
+        Ok(results)
+    }
+
     /// The placed footprint carrying `reference`, and its index among items.
     fn find_footprint_instance(
         &self,

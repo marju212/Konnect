@@ -479,6 +479,54 @@ pub struct IpcFootprintGraphic {
     pub editable: bool,
 }
 
+/// A text inside a placed footprint: a field (reference, value, datasheet,
+/// description or a custom one such as LCSC) or a plain `fp_text` item.
+///
+/// `position` is absolute board millimetres, as KiCad's text properties and
+/// DRC report it; `local` is the same point in the footprint's own frame, as
+/// the `.kicad_mod` shows it. `angle` is the absolute board angle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpcFootprintText {
+    pub reference: String,
+    /// Field name, `None` for a plain text item.
+    pub field: Option<String>,
+    /// UUID of a plain text item; fields are addressed by name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uuid: Option<String>,
+    pub text: String,
+    pub layer: String,
+    pub position: IpcVector2,
+    pub local: IpcVector2,
+    pub angle: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<IpcVector2>,
+    pub visible: bool,
+}
+
+/// Which text of a footprint an [`IpcFootprintTextEdit`] addresses.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum IpcTextTarget {
+    /// A field by name, matched case-insensitively; `ref` and `val` work.
+    Field(String),
+    /// A plain text item by UUID.
+    Uuid(String),
+}
+
+/// One move of a footprint text. At most one of `position` (absolute board
+/// mm), `offset` (board mm from where it is) and `local` (footprint-local
+/// mm) is given; every `None` leaves that property as it is.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpcFootprintTextEdit {
+    pub reference: String,
+    pub target: IpcTextTarget,
+    pub position: Option<(f64, f64)>,
+    pub offset: Option<(f64, f64)>,
+    pub local: Option<(f64, f64)>,
+    pub angle: Option<f64>,
+    pub layer: Option<String>,
+    pub visible: Option<bool>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcNet {
     pub name: String,

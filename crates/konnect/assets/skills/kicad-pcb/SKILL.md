@@ -233,6 +233,11 @@ an unproved outline is not completion evidence.
 - Standard grid: 0.5mm for placement, 0.25mm for fine adjustment
 - Check component courtyard overlaps after placement
 - Reference designator text: F.SilkS layer, 1mm height default
+- Silkscreen cleanup after placement: `run_drc` reports `silk_overlap` and
+  `silk_over_copper` at board coordinates; `list_board_footprint_texts` gives
+  each reference's position and size; `move_footprint_texts` moves them in one
+  batch (`local_x`/`local_y` follow the part's rotation, `layer: "F.Fab"` or
+  `visible: false` takes a text off the silkscreen). Save, then re-run DRC.
 
 ---
 

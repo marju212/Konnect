@@ -4,6 +4,7 @@ pub mod gen;
 pub mod builders;
 pub mod client;
 mod endpoint;
+pub mod footprint_text;
 pub mod socket;
 pub mod transform;
 pub mod types;

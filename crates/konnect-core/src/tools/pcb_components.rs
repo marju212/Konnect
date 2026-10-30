@@ -930,7 +930,9 @@ pub(crate) fn build_footprint_item_with_extras(
 }
 
 /// The library data of a footprint source that the typed builder leaves out.
-pub(crate) fn library_extras(source: &str) -> anyhow::Result<super::library_footprint::LibraryExtras> {
+pub(crate) fn library_extras(
+    source: &str,
+) -> anyhow::Result<super::library_footprint::LibraryExtras> {
     let root = konnect_sexp::parse_sexp(source).context("invalid footprint S-expression")?;
     super::library_footprint::LibraryExtras::read(&root)
 }
@@ -1878,6 +1880,65 @@ fn indent_block(block: &str, indent: &str, eol: &str) -> String {
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
+/// The footprint-text tools. They live in this file next to the other
+/// placed-footprint edits but are listed in `pcb_board`, beside board text,
+/// because `pcb_components` is at the per-toolset cap.
+pub fn footprint_text_tools() -> Vec<ToolDef> {
+    vec![
+        tool!(
+            "list_board_footprint_texts",
+            "List the texts of footprints placed on the board: the reference and value fields, custom fields such as LCSC, and plain text items. Each reports its field name (or UUID for a plain text), text, layer, absolute board 'position' in mm (the coordinates DRC and KiCad's properties dialog use), footprint-local 'local' mm (as the .kicad_mod shows them), absolute 'angle', 'size' and 'visible'. Use it with run_drc's silk_overlap / silk_over_copper locations to decide where move_footprint_texts should put a reference. Requires KiCAD running with the board open.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board":      { "type": "string" },
+                    "references": { "type": "array", "items": { "type": "string" }, "description": "Only these reference designators (optional; default every footprint)" },
+                    "layer":      { "type": "string", "description": "Only texts on this layer, e.g. 'F.SilkS' (optional)" },
+                    "field":      { "type": "string", "description": "Only this field, e.g. 'Reference' (optional)" }
+                },
+                "required": ["board"]
+            }),
+            |args, ctx| async move { handle_list_board_footprint_texts(args, ctx).await }
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
+        tool!(
+            "move_footprint_texts",
+            "Move, rotate, re-layer or hide texts of footprints placed on the board (reference designators, values, custom fields, plain texts) without moving the footprints. Each move names a footprint and a field ('Reference', 'Value', a custom field name; 'ref'/'val' work) or the UUID of a plain text, then at most one of: x/y (absolute board mm), dx/dy (board mm from where the text is now) or local_x/local_y (footprint-local mm, follows the part's rotation); plus optional angle (absolute board degrees), layer and visible. Every move is checked first and the whole batch is sent as one KiCad edit (one undo step); a refused move sends nothing. Save with save_project afterwards. Requires KiCAD running with the board open.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string" },
+                    "moves": {
+                        "type": "array",
+                        "description": "The text edits, applied in order.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "reference": { "type": "string", "description": "Footprint reference designator, e.g. 'R12'" },
+                                "field":     { "type": "string", "description": "Field name; default 'Reference' when no uuid is given" },
+                                "uuid":      { "type": "string", "description": "UUID of a plain text item, from list_board_footprint_texts" },
+                                "x":         { "type": "number" },
+                                "y":         { "type": "number" },
+                                "dx":        { "type": "number" },
+                                "dy":        { "type": "number" },
+                                "local_x":   { "type": "number" },
+                                "local_y":   { "type": "number" },
+                                "angle":     { "type": "number", "description": "Absolute text angle in degrees" },
+                                "layer":     { "type": "string", "description": "e.g. 'F.SilkS', 'F.Fab'" },
+                                "visible":   { "type": "boolean", "description": "Fields only" }
+                            },
+                            "required": ["reference"]
+                        }
+                    }
+                },
+                "required": ["board", "moves"]
+            }),
+            |args, ctx| async move { handle_move_footprint_texts(args, ctx).await }
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
+    ]
+}
+
 pub fn tools() -> Vec<ToolDef> {
     let mut tools = vec![
         tool!(
@@ -2438,6 +2499,159 @@ async fn handle_edit_board_footprint_graphic(
         "uuid": uuid,
         "kind": kind,
         "points": points.len(),
+    })))
+}
+
+async fn handle_list_board_footprint_texts(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let references: Vec<String> = match &args["references"] {
+        serde_json::Value::Null => Vec::new(),
+        serde_json::Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                match item.as_str() {
+                    Some(r) => out.push(r.to_string()),
+                    None => {
+                        return Ok(crate::tools::invalid_arg(
+                            "references",
+                            "every entry must be a string",
+                        ))
+                    }
+                }
+            }
+            out
+        }
+        _ => {
+            return Ok(crate::tools::invalid_arg(
+                "references",
+                "must be an array of strings",
+            ))
+        }
+    };
+    let layer_filter = args["layer"].as_str().map(|s| s.to_string());
+    let field_filter = args["field"].as_str().map(|s| s.to_string());
+
+    let texts: Vec<konnect_ipc::types::IpcFootprintText> =
+        ipc!(ctx, args, |c| c.list_footprint_texts(&references));
+    let texts: Vec<_> = texts
+        .into_iter()
+        .filter(|t| layer_filter.as_deref().is_none_or(|l| t.layer == l))
+        .filter(|t| {
+            field_filter.as_deref().is_none_or(|f| {
+                t.field
+                    .as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(f))
+            })
+        })
+        .collect();
+
+    Ok(CallToolResult::json(&json!({
+        "count": texts.len(),
+        "texts": texts,
+    })))
+}
+
+/// Parse `move_footprint_texts`'s `moves` into typed edits, refusing a
+/// malformed entry by its index before anything reaches KiCad.
+fn parse_text_moves(
+    value: &serde_json::Value,
+) -> Result<Vec<konnect_ipc::types::IpcFootprintTextEdit>, CallToolResult> {
+    use konnect_ipc::types::{IpcFootprintTextEdit, IpcTextTarget};
+    let invalid = |reason: String| crate::tools::invalid_arg("moves", &reason);
+    let Some(items) = value.as_array() else {
+        return Err(invalid("must be an array of moves".to_string()));
+    };
+    if items.is_empty() {
+        return Err(invalid("is empty".to_string()));
+    }
+    let mut out = Vec::with_capacity(items.len());
+    for (i, item) in items.iter().enumerate() {
+        let Some(obj) = item.as_object() else {
+            return Err(invalid(format!("entry {i} is not an object")));
+        };
+        let Some(reference) = obj.get("reference").and_then(|v| v.as_str()) else {
+            return Err(invalid(format!("entry {i} has no 'reference' string")));
+        };
+        let num = |key: &str| -> Result<Option<f64>, CallToolResult> {
+            match obj.get(key) {
+                None | Some(serde_json::Value::Null) => Ok(None),
+                Some(v) => v
+                    .as_f64()
+                    .map(Some)
+                    .ok_or_else(|| invalid(format!("entry {i}: '{key}' is not a number"))),
+            }
+        };
+        let pair = |a: &str, b: &str| -> Result<Option<(f64, f64)>, CallToolResult> {
+            match (num(a)?, num(b)?) {
+                (Some(x), Some(y)) => Ok(Some((x, y))),
+                (None, None) => Ok(None),
+                _ => Err(invalid(format!("entry {i}: give both '{a}' and '{b}'"))),
+            }
+        };
+        let target = match (
+            obj.get("field").and_then(|v| v.as_str()),
+            obj.get("uuid").and_then(|v| v.as_str()),
+        ) {
+            (Some(_), Some(_)) => {
+                return Err(invalid(format!(
+                    "entry {i}: give 'field' or 'uuid', not both"
+                )))
+            }
+            (_, Some(uuid)) => IpcTextTarget::Uuid(uuid.to_string()),
+            (Some(field), None) => IpcTextTarget::Field(field.to_string()),
+            (None, None) => IpcTextTarget::Field("Reference".to_string()),
+        };
+        let visible = match obj.get("visible") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(v) => Some(
+                v.as_bool()
+                    .ok_or_else(|| invalid(format!("entry {i}: 'visible' is not a boolean")))?,
+            ),
+        };
+        let edit = IpcFootprintTextEdit {
+            reference: reference.to_string(),
+            target,
+            position: pair("x", "y")?,
+            offset: pair("dx", "dy")?,
+            local: pair("local_x", "local_y")?,
+            angle: num("angle")?,
+            layer: obj
+                .get("layer")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            visible,
+        };
+        let modes = [edit.position, edit.offset, edit.local]
+            .iter()
+            .filter(|m| m.is_some())
+            .count();
+        if modes > 1 {
+            return Err(invalid(format!(
+                "entry {i}: give at most one of x/y, dx/dy or local_x/local_y"
+            )));
+        }
+        out.push(edit);
+    }
+    Ok(out)
+}
+
+async fn handle_move_footprint_texts(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let moves = match parse_text_moves(&args["moves"]) {
+        Ok(m) => m,
+        Err(e) => return Ok(e),
+    };
+    let texts: Vec<konnect_ipc::types::IpcFootprintText> =
+        ipc!(ctx, args, |c| c.edit_footprint_texts(&moves));
+    Ok(CallToolResult::json(&json!({
+        "moved": texts.len(),
+        "texts": texts,
+        "saved": false,
+        "next": "save_project to write the board file",
     })))
 }
 
@@ -7274,6 +7488,66 @@ mod board_footprint_graphics_tests {
                 .expect("valid"),
             vec![(0.0, 0.0), (3.0, 0.0), (3.0, 3.0)]
         );
+    }
+
+    #[test]
+    fn text_moves_parse_targets_and_modes() {
+        use konnect_ipc::types::IpcTextTarget;
+        let moves = parse_text_moves(&json!([
+            { "reference": "R1", "x": 1, "y": 2 },
+            { "reference": "R2", "field": "Value", "dx": 0.5, "dy": 0 },
+            { "reference": "R3", "uuid": "u-1", "local_x": 0, "local_y": -1.5, "angle": 90, "visible": true }
+        ]))
+        .expect("valid");
+        assert_eq!(
+            moves[0].target,
+            IpcTextTarget::Field("Reference".to_string())
+        );
+        assert_eq!(moves[0].position, Some((1.0, 2.0)));
+        assert_eq!(moves[1].target, IpcTextTarget::Field("Value".to_string()));
+        assert_eq!(moves[1].offset, Some((0.5, 0.0)));
+        assert_eq!(moves[2].target, IpcTextTarget::Uuid("u-1".to_string()));
+        assert_eq!(moves[2].local, Some((0.0, -1.5)));
+        assert_eq!(moves[2].angle, Some(90.0));
+        assert_eq!(moves[2].visible, Some(true));
+    }
+
+    #[test]
+    fn malformed_text_moves_are_refused_as_invalid_arguments() {
+        for bad in [
+            json!([]),
+            json!({}),
+            json!([{ "x": 1, "y": 2 }]),
+            json!([{ "reference": "R1", "x": 1 }]),
+            json!([{ "reference": "R1", "x": 1, "y": 2, "dx": 1, "dy": 1 }]),
+            json!([{ "reference": "R1", "field": "Value", "uuid": "u" }]),
+            json!([{ "reference": "R1", "angle": "ninety" }]),
+            json!([{ "reference": "R1", "visible": "no" }]),
+        ] {
+            let err = parse_text_moves(&bad).expect_err(&format!("{bad} should be refused"));
+            assert!(err.is_error, "{bad}");
+        }
+    }
+
+    #[test]
+    fn footprint_text_tools_are_registered_with_the_arguments_they_read() {
+        let tools = crate::tools::pcb_board::tools();
+        for (name, required) in [
+            ("list_board_footprint_texts", vec!["board"]),
+            ("move_footprint_texts", vec!["board", "moves"]),
+        ] {
+            let def = tools
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("{name} is not registered"));
+            let got: Vec<&str> = def.input_schema["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect();
+            assert_eq!(got, required, "{name} required arguments");
+        }
     }
 
     /// The two tools are registered, sit in `pcb_components`, and require the
