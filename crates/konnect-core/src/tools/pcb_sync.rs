@@ -1954,12 +1954,23 @@ fn snapshot_board(client: &konnect_ipc::KiCadIpcClient, board: &Path) -> Result<
             record_routed_net(&mut routed_nets, via.net.as_ref());
         }
     }
-    if !client
-        .get_items_in(document.clone(), ObjectType::KotPcbZone)?
-        .is_empty()
-    {
-        // KiCad 10's Zone protobuf does not expose the zone net. A pad-net
-        // reassignment on a zoned board therefore fails closed.
+    // A copper zone carries its net in `copper_settings`; a rule area has
+    // none and routes nothing. A copper zone whose net cannot be read (an
+    // undecodable item, or settings without a net) still fails closed: every
+    // net counts as routed, so no pad reassignment can strand its fill.
+    let mut zone_net_unknown = false;
+    for item in client.get_items_in(document.clone(), ObjectType::KotPcbZone)? {
+        let Ok(zone) = kiapi::board::types::Zone::decode(item.value.as_slice()) else {
+            zone_net_unknown = true;
+            continue;
+        };
+        match zone_copper_net(&zone) {
+            ZoneNet::RuleArea => {}
+            ZoneNet::Net(net) => record_routed_net(&mut routed_nets, Some(net)),
+            ZoneNet::Unknown => zone_net_unknown = true,
+        }
+    }
+    if zone_net_unknown {
         for net in net_codes.keys() {
             *routed_nets.entry(net.clone()).or_insert(0) += 1;
         }
@@ -2182,6 +2193,27 @@ fn board_layer_name(layer: i32) -> String {
         Some(BoardLayer::BlBCu) => "B.Cu".to_string(),
         Some(layer) => layer.as_str_name().to_string(),
         None => format!("layer_{layer}"),
+    }
+}
+
+enum ZoneNet<'a> {
+    RuleArea,
+    Net(&'a konnect_ipc::gen::kiapi::board::types::Net),
+    Unknown,
+}
+
+fn zone_copper_net(zone: &konnect_ipc::gen::kiapi::board::types::Zone) -> ZoneNet<'_> {
+    use konnect_ipc::gen::kiapi::board::types::{zone::Settings, ZoneType};
+    if zone.r#type == ZoneType::ZtRuleArea as i32 {
+        return ZoneNet::RuleArea;
+    }
+    match &zone.settings {
+        Some(Settings::RuleAreaSettings(_)) => ZoneNet::RuleArea,
+        Some(Settings::CopperSettings(copper)) => match copper.net.as_ref() {
+            Some(net) if !net.name.is_empty() => ZoneNet::Net(net),
+            _ => ZoneNet::Unknown,
+        },
+        None => ZoneNet::Unknown,
     }
 }
 
@@ -5859,5 +5891,33 @@ mod tests {
             "{}",
             refusal.1
         );
+    }
+
+    #[test]
+    fn copper_zone_reports_its_net_and_rule_area_none() {
+        use konnect_ipc::gen::kiapi::board::types::{zone::Settings, CopperZoneSettings, Net, Zone};
+        let copper = Zone::decode(
+            &include_bytes!("../../tests/fixtures/issue_474_copper_zone_0.ipc.bin")[..],
+        )
+        .expect("captured copper zone");
+        let keepout = Zone::decode(
+            &include_bytes!("../../tests/fixtures/issue_474_zone_0.ipc.bin")[..],
+        )
+        .expect("captured rule area");
+        // KiCad 10 does report a copper zone's net (this capture is a live one).
+        assert!(matches!(zone_copper_net(&copper), ZoneNet::Net(net) if net.name == "GND"));
+        assert!(matches!(zone_copper_net(&keepout), ZoneNet::RuleArea));
+
+        let mut named = Zone::default();
+        named.settings = Some(Settings::CopperSettings(CopperZoneSettings {
+            net: Some(Net { name: "GND".into(), ..Default::default() }),
+            ..Default::default()
+        }));
+        assert!(matches!(zone_copper_net(&named), ZoneNet::Net(net) if net.name == "GND"));
+
+        let mut unnamed = Zone::default();
+        unnamed.settings = Some(Settings::CopperSettings(CopperZoneSettings::default()));
+        assert!(matches!(zone_copper_net(&unnamed), ZoneNet::Unknown));
+        assert!(matches!(zone_copper_net(&Zone::default()), ZoneNet::Unknown));
     }
 }

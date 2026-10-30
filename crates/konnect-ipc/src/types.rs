@@ -243,6 +243,14 @@ impl std::fmt::Display for IpcSelectionObservationError {
 
 impl std::error::Error for IpcSelectionObservationError {}
 
+
+/// What a deleted via was, for the caller's undo record.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IpcViaPreimage {
+    pub uuid: String,
+    pub net_name: String,
+    pub position: IpcVector2,
+}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IpcVector2 {
     pub x: f64,

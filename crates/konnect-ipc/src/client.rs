@@ -2976,6 +2976,44 @@ impl KiCadIpcClient {
         Ok(Some(track))
     }
 
+    /// Delete one via by UUID, then read the vias back to prove it is gone.
+    /// Returns `Ok(None)` without deleting anything when the UUID is not a
+    /// via on the requested board.
+    pub fn delete_via_verified(&self, requested: &Path, uuid: &str) -> Result<Option<IpcViaPreimage>> {
+        let document = self.find_open_board(requested)?;
+        let vias = |document| -> Result<Vec<kiapi::board::types::Via>> {
+            Ok(self
+                .get_items_in(document, kiapi::common::types::KiCadObjectType::KotPcbVia)?
+                .iter()
+                .filter_map(|item| decode_as::<kiapi::board::types::Via>(item, "kiapi.board.types.Via"))
+                .collect())
+        };
+        let Some(via) = vias(document.clone())?
+            .into_iter()
+            .find(|via| via.id.as_ref().is_some_and(|id| id.value == uuid))
+        else {
+            return Ok(None);
+        };
+        self.delete_items_in(document.clone(), vec![uuid.to_string()])?;
+        let remains = vias(document)
+            .with_context(|| {
+                format!(
+                    "KiCad accepted deletion of via '{}' but post-delete read-back failed; the deletion may have committed",
+                    uuid
+                )
+            })?
+            .iter()
+            .any(|candidate| candidate.id.as_ref().is_some_and(|id| id.value == uuid));
+        if remains {
+            anyhow::bail!("KiCad accepted deletion of via '{}' but read-back still reports it", uuid);
+        }
+        Ok(Some(IpcViaPreimage {
+            uuid: uuid.to_string(),
+            net_name: via.net.map(|net| net.name).unwrap_or_default(),
+            position: via.position.map(point_in_mm).unwrap_or(IpcVector2 { x: 0.0, y: 0.0 }),
+        }))
+    }
+
     /// Delete a board item by UUID.
     ///
     /// This low-level compatibility helper does not verify an item type or

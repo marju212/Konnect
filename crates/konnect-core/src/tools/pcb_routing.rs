@@ -168,12 +168,12 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
             "delete_trace",
-            "Delete a trace segment identified by its UUID via KiCAD IPC. Refuses UUIDs that are not observed trace segments on the requested board, then verifies the segment is absent before reporting success. Returns the observed preimage and postcondition.",
+            "Delete a trace segment or a via identified by its UUID via KiCAD IPC. Refuses UUIDs that are not observed trace segments or vias on the requested board, then verifies the segment is absent before reporting success. Returns the observed preimage and postcondition.",
             json!({
                 "type": "object",
                 "properties": {
                     "board": { "type": "string" },
-                    "uuid":  { "type": "string", "description": "UUID of the track segment to delete" }
+                    "uuid":  { "type": "string", "description": "UUID of the track segment or via to delete" }
                 },
                 "required": ["board", "uuid"]
             }),
@@ -1047,13 +1047,42 @@ async fn handle_delete_trace(
     };
 
     let Some(trace) = deleted else {
+        // Not a trace segment: a via is the other routing item a caller
+        // places by hand and may need to take back.
+        let board_ipc = board.clone();
+        let uuid_ipc = uuid.clone();
+        let via = match with_board_ipc_classified(ctx, &board, move |client, _| {
+            client.delete_via_verified(&board_ipc, &uuid_ipc)
+        })
+        .await?
+        {
+            Ok(via) => via,
+            Err(error) => {
+                return Ok(CallToolResult::error(format!(
+                    "KiCAD must be running with the board loaded (IPC error: {})",
+                    error.message()
+                )))
+            }
+        };
+        if let Some(via) = via {
+            return Ok(CallToolResult::json(&json!({
+                "deleted_uuid": via.uuid,
+                "deleted_type": "via",
+                "preimage": {
+                    "uuid": via.uuid,
+                    "net": via.net_name,
+                    "at": { "x": via.position.x, "y": via.position.y }
+                },
+                "postcondition": "absent_from_via_readback"
+            })));
+        }
         return Ok(CallToolResult::error_kind(
             ToolErrorKind::StaleTarget {
                 target: uuid,
-                reason: "the UUID is not an observed trace segment on the requested board"
+                reason: "the UUID is not an observed trace segment or via on the requested board"
                     .to_string(),
             },
-            "The requested UUID is not a trace segment on the requested board. No board item was deleted.",
+            "The requested UUID is not a trace segment or via on the requested board. No board item was deleted.",
         ));
     };
 
@@ -1130,6 +1159,67 @@ mod delete_trace_tests {
         }
         assert_eq!(*delete_count.lock().unwrap(), 0);
         assert_eq!(std::fs::read(&board).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn a_via_uuid_deletes_the_via_and_reports_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("target.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (version 20260206))").unwrap();
+        let deleted = Arc::new(Mutex::new(false));
+        let deleted_in_mock = deleted.clone();
+        let mut via = konnect_ipc::builders::build_via("/BUCK_EN", 9, 128.3, 49.0, 0.4, 0.8);
+        via.id = Some(kiapi::common::types::Kiid {
+            value: "via-7".to_string(),
+        });
+        let packed_via = konnect_ipc::builders::pack_any(&via, "kiapi.board.types.Via");
+        let server = spawn_kicad_holding_board(&board, move |command| {
+            if command.type_url.ends_with("GetItems") {
+                let items = if *deleted_in_mock.lock().unwrap() {
+                    vec![]
+                } else {
+                    vec![packed_via.clone()]
+                };
+                return Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::GetItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        items,
+                    },
+                    "kiapi.common.commands.GetItemsResponse",
+                ));
+            }
+            if command.type_url.ends_with("DeleteItems") {
+                *deleted_in_mock.lock().unwrap() = true;
+                return Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::DeleteItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        deleted_items: vec![],
+                    },
+                    "kiapi.common.commands.DeleteItemsResponse",
+                ));
+            }
+            None
+        });
+
+        let result = handle_delete_trace(
+            &json!({ "board": board.to_string_lossy(), "uuid": "via-7" }),
+            &ctx_talking_to(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{result:?}");
+        let text = match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text,
+            other => panic!("expected text result, got {other:?}"),
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["deleted_type"], json!("via"));
+        assert_eq!(body["preimage"]["net"], json!("/BUCK_EN"));
+        assert_eq!(body["preimage"]["at"]["x"], json!(128.3));
+        assert!(*deleted.lock().unwrap());
     }
 
     #[tokio::test]
