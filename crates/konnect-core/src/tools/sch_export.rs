@@ -193,7 +193,9 @@ pub fn tools() -> Vec<ToolDef> {
              run a conflict whose diagnostics name the footprint and every part that needs it. \
              Added footprints are staged beside the board as KiCad measured it; `staging` \
              names the item classes KiCad would not list, so a partial or unmeasured board \
-             is never reported as complete or empty.",
+             is never reported as complete or empty. A pad may change net unless a track \
+             or via of its old net touches it; a copper pour on either net does not block, \
+             and `zones_to_refill` names the pour nets to refill after the apply.",
             json!({
                 "type": "object",
                 "properties": {

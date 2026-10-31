@@ -315,6 +315,11 @@ struct SyncPlan {
     /// Survives a conflict: it is a report about the schematic, not a change
     /// the plan would make.
     unassigned: Vec<UnassignedFootprint>,
+    /// Copper-zone nets a planned pad reassignment involves. Their fills are
+    /// stale after the apply until the caller refills the zones; a pour is
+    /// recomputed from the pads, so it does not block the change the way a
+    /// track does.
+    zones_to_refill: BTreeSet<String>,
     /// What the live board's measured extent was, set from the snapshot the
     /// plan was made against, so the dry run and the apply report the same.
     /// Not part of the plan's identity: `sync_response` reports it.
@@ -611,6 +616,9 @@ fn sync_response(
         },
         "changes": plan.changes,
         "diagnostics": plan.diagnostics,
+        // Copper-zone nets a pad reassignment touches: refill the zones after
+        // the apply, or their fills stay as they were before it.
+        "zones_to_refill": plan.zones_to_refill,
         // Schematic components with no footprint: reported per part with what
         // the board holds for them, never planned and never fatal (#507). A
         // collection takes a plural noun (docs/NAMING_CONVENTIONS.md); the
@@ -654,6 +662,7 @@ fn conflict_result(message: String) -> CallToolResult {
 
 fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) -> SyncPlan {
     let mut diagnostics = Vec::new();
+    let mut zones_to_refill = BTreeSet::new();
     let mut counts = SyncCounts::default();
     let mut changes = Vec::new();
     let mut board_by_path = HashMap::new();
@@ -945,14 +954,23 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
                 continue;
             }
             // With the live copper in hand, only copper of the old net that
-            // reaches this very pad (or a pour on either net) blocks the
-            // change: KiCad itself reassigns pads freely, and a pad no track
-            // touches strands nothing. Without it, any routed net blocks.
+            // reaches this very pad blocks the change: KiCad itself reassigns
+            // pads freely, and a pad no track touches strands nothing. A pour
+            // on either net does not block, because a refill recomputes it
+            // from the pads; the plan names it in `zones_to_refill` instead.
+            // A zone whose net could not be read still fails closed. Without
+            // the live copper, any routed net blocks.
             let blocked = match &board.copper {
                 Some(copper) => {
-                    copper.poured(old_net)
-                        || copper.poured(new_net)
-                        || (!old_net.is_empty() && copper.touches_pad(footprint, number, old_net))
+                    let touched = !old_net.is_empty() && copper.touches_pad(footprint, number, old_net);
+                    if !touched && !copper.zone_net_unknown {
+                        for net in [old_net, new_net] {
+                            if copper.poured(net) {
+                                zones_to_refill.insert(net.to_string());
+                            }
+                        }
+                    }
+                    touched || copper.zone_net_unknown
                 }
                 None => board.routed_nets.contains_key(old_net) || board.routed_nets.contains_key(new_net),
             };
@@ -1020,6 +1038,8 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
         plan_revision,
         counts,
         changes,
+        // A conflicted plan reassigns nothing, so it leaves no fill stale.
+        zones_to_refill: if diagnostics.is_empty() { zones_to_refill } else { BTreeSet::new() },
         diagnostics,
         unassigned,
         // Set by the handler from the snapshot this plan was made against.
@@ -3931,9 +3951,55 @@ mod tests {
     }
 
     #[test]
-    fn a_poured_net_on_either_side_blocks_the_change() {
-        assert_eq!(pad_move_plan(Vec::new(), &["BUS"]).status, PlanStatus::Conflict);
-        assert_eq!(pad_move_plan(Vec::new(), &["VCC"]).status, PlanStatus::Conflict);
+    fn a_poured_net_on_either_side_asks_for_a_refill_instead_of_blocking() {
+        for poured in ["BUS", "VCC"] {
+            let plan = pad_move_plan(Vec::new(), &[poured]);
+            assert_eq!(plan.status, PlanStatus::Ready, "{:?}", plan.diagnostics);
+            assert_eq!(plan.zones_to_refill, BTreeSet::from([poured.to_string()]));
+        }
+    }
+
+    #[test]
+    fn a_poured_net_with_copper_on_the_pad_still_blocks() {
+        let track = vec![CopperPiece::Segment {
+            a: Point { x: -3.0, y: 2.0 },
+            b: Point { x: 0.2, y: 2.0 },
+            half_width: 0.2,
+        }];
+        let plan = pad_move_plan(track, &["VCC"]);
+        assert_eq!(plan.status, PlanStatus::Conflict);
+        assert!(plan.zones_to_refill.is_empty());
+    }
+
+    #[test]
+    fn a_zone_of_unknown_net_still_blocks_the_change() {
+        let mut plan_board = pad_move_plan(Vec::new(), &[]);
+        assert_eq!(plan_board.status, PlanStatus::Ready);
+        // Same move with a zone whose net could not be read.
+        let design = ExportedDesign {
+            components: vec![DesignComponent {
+                pad_nets: BTreeMap::from([
+                    ("1".to_string(), "BUS".to_string()),
+                    ("2".to_string(), "GND".to_string()),
+                ]),
+                ..resistor("R1", "/sheet/existing")
+            }],
+            skipped: Vec::new(),
+            unassigned: Vec::new(),
+        };
+        let mut footprint = board_resistor("R1", Some("/sheet/existing"));
+        footprint.pad_reach = vec![
+            PadReach { number: "1".to_string(), at: Point { x: 0.2, y: 2.0 }, radius: 0.6 },
+            PadReach { number: "2".to_string(), at: Point { x: 1.8, y: 2.0 }, radius: 0.6 },
+        ];
+        let mut board = board_with(vec![footprint]);
+        board.copper = Some(RoutedCopper {
+            pieces: BTreeMap::new(),
+            zone_nets: BTreeSet::new(),
+            zone_net_unknown: true,
+        });
+        plan_board = plan_sync("netlist", &design, &board);
+        assert_eq!(plan_board.status, PlanStatus::Conflict);
     }
 
     #[test]
@@ -5064,6 +5130,7 @@ mod tests {
             changes,
             diagnostics: Vec::new(),
             unassigned: Vec::new(),
+            zones_to_refill: BTreeSet::new(),
             staging: None,
         }
     }
