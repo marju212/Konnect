@@ -220,7 +220,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "board": { "type": "string", "description": "Path to .kicad_pcb file" },
                     "name": { "type": "string", "description": "Rule name, as in (rule \"<name>\" ...)" },
                     "rule": { "type": "string", "description": "Full rule S-expression; required unless delete is true" },
-                    "comment": { "type": "string", "description": "Optional comment text placed above a newly added rule, one '# ' line per input line" },
+                    "comment": { "type": "string", "description": "Optional comment text, one '# ' line per input line: placed above a new rule, or replacing the comment lines directly above an existing one" },
                     "delete": { "type": "boolean", "description": "Remove the named rule instead of writing it" }
                 },
                 "required": ["board", "name"]
@@ -1309,6 +1309,31 @@ fn validate_custom_rule(rule: &str, name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Replace the run of `#` comment lines directly above the named rule with `comment`.
+fn replace_rule_comment(content: &str, name: &str, comment: &str) -> String {
+    let Some((start, _)) = named_rule_range(content, name) else {
+        return content.to_string();
+    };
+    let head = &content[..start];
+    let mut lines: Vec<&str> = head.split_inclusive('\n').collect();
+    // the rule starts at the beginning of a line; drop the comment lines right above it
+    while let Some(last) = lines.last() {
+        if last.trim_start().starts_with('#') {
+            lines.pop();
+        } else {
+            break;
+        }
+    }
+    let mut out: String = lines.concat();
+    for line in comment.lines() {
+        out.push_str("# ");
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    out.push_str(&content[start..]);
+    out
+}
+
 async fn handle_set_custom_rule(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -1359,7 +1384,11 @@ async fn handle_set_custom_rule(
             )));
         }
         if previous.is_some() {
-            (upsert_named_rule(&content, &name, &rule), "replaced")
+            let replaced = upsert_named_rule(&content, &name, &rule);
+            match opt_str(args, "comment") {
+                Some(comment) => (replace_rule_comment(&replaced, &name, comment), "replaced"),
+                None => (replaced, "replaced"),
+            }
         } else {
             let mut block = String::new();
             if let Some(comment) = opt_str(args, "comment") {
@@ -2066,6 +2095,28 @@ mod tests {
         assert!(text.contains("(rule \"a\""));
         assert!(text.contains("(rule \"c\""));
         assert!(text.starts_with("(version 1)"));
+    }
+
+    #[tokio::test]
+    async fn set_custom_rule_replaces_the_comment_above_an_existing_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        tokio::fs::write(&board, blank_board()).await.unwrap();
+        let rules_path = dir.path().join("board.kicad_dru");
+        let original = "(version 1)\n\n# first\n(rule \"a\" (constraint clearance (min 0.2mm)))\n\n# old line 1\n# old line 2\n(rule \"b\"\n\t(constraint clearance (min 0.3mm)))\n";
+        tokio::fs::write(&rules_path, original).await.unwrap();
+        let result = handle_set_custom_rule(
+            &json!({"board": board, "name": "b", "comment": "new text\nsecond",
+                    "rule": "(rule \"b\"\n\t(constraint clearance (min 0.25mm)))"}),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+        let text = tokio::fs::read_to_string(&rules_path).await.unwrap();
+        assert!(!text.contains("old line"));
+        assert!(text.contains("# first\n(rule \"a\""));
+        assert!(text.contains("\n\n# new text\n# second\n(rule \"b\"\n\t(constraint clearance (min 0.25mm)))"));
     }
 
     #[tokio::test]
