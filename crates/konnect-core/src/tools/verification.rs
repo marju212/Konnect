@@ -204,6 +204,30 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_set_layer_constraints(args, ctx).await }
         ),
         tool!(
+            "set_custom_rule",
+            "Add, replace or delete one named rule in the board's sibling .kicad_dru custom rules \
+             file (Board Setup > Custom Rules), leaving every other rule and comment as it is. \
+             `rule` is the whole rule as KiCad writes it: `(rule \"<name>\" (condition ...) \
+             (constraint ...) ...)`; its name must equal `name`. The text is checked to be one \
+             balanced S-expression before anything is written; KiCad's own rule parser is not run, \
+             so verify with run_drc. `comment` lines (without '#') go directly above a new rule. \
+             `delete: true` removes the named rule. The response returns the rule's previous text \
+             for undo. KiCad's PCB editor reads the file when the board is opened: reopen the board \
+             (or run kicad-cli DRC with --refill-zones) before judging fills against a changed rule.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string", "description": "Path to .kicad_pcb file" },
+                    "name": { "type": "string", "description": "Rule name, as in (rule \"<name>\" ...)" },
+                    "rule": { "type": "string", "description": "Full rule S-expression; required unless delete is true" },
+                    "comment": { "type": "string", "description": "Optional comment text placed above a newly added rule, one '# ' line per input line" },
+                    "delete": { "type": "boolean", "description": "Remove the named rule instead of writing it" }
+                },
+                "required": ["board", "name"]
+            }),
+            |args, ctx| async move { handle_set_custom_rule(args, ctx).await }
+        ),
+        tool!(
             "check_clearance",
             "Measure spacing between two footprints on the requested board. `mode: anchor` \
              (the compatibility default) returns straight-line placement-anchor distance. \
@@ -1223,6 +1247,151 @@ async fn handle_set_layer_constraints(
     ))
 }
 
+// ─── Custom rules ────────────────────────────────────────────────────────────
+
+/// Check that `rule` is exactly one balanced S-expression `(rule "<name>" ...)`.
+fn validate_custom_rule(rule: &str, name: &str) -> Result<(), String> {
+    let trimmed = rule.trim();
+    let head = format!("(rule \"{name}\"");
+    if !trimmed.starts_with(&head) {
+        return Err(format!("rule must start with {head}"));
+    }
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut in_comment = false;
+    let mut closed_at = None;
+    for (offset, character) in trimmed.char_indices() {
+        if in_comment {
+            if character == '\n' {
+                in_comment = false;
+            }
+            continue;
+        }
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if closed_at.is_some() {
+            if character.is_whitespace() {
+                continue;
+            }
+            return Err("text after the rule's closing parenthesis".to_string());
+        }
+        match character {
+            '#' => in_comment = true,
+            '"' => in_string = true,
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth < 0 {
+                    return Err("unbalanced ')'".to_string());
+                }
+                if depth == 0 {
+                    closed_at = Some(offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    if in_string {
+        return Err("unterminated string".to_string());
+    }
+    if closed_at.is_none() {
+        return Err("unbalanced '(': the rule is not closed".to_string());
+    }
+    Ok(())
+}
+
+async fn handle_set_custom_rule(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board = get_path(args, "board")?;
+    let name = match require_str(args, "name") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    if name.is_empty() || name.contains('"') || name.contains('\n') {
+        return Ok(CallToolResult::error(
+            "Rule name must be non-empty and contain no quotes or newlines",
+        ));
+    }
+    let delete = args["delete"].as_bool().unwrap_or(false);
+    let rules_path = sibling_custom_rules_path(&board);
+    let content = match tokio::fs::read_to_string(&rules_path).await {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "(version 1)\n".to_string(),
+        Err(error) => return Err(error.into()),
+    };
+    let previous = named_rule_range(&content, &name).map(|(a, b)| content[a..b].to_string());
+
+    let (new_content, action) = if delete {
+        let Some((start, end)) = named_rule_range(&content, &name) else {
+            return Ok(CallToolResult::error(format!(
+                "No rule named '{name}' in {}",
+                rules_path.display()
+            )));
+        };
+        let mut joined = format!("{}{}", &content[..start], &content[end..]);
+        while joined.contains("\n\n\n") {
+            joined = joined.replace("\n\n\n", "\n\n");
+        }
+        (joined, "deleted")
+    } else {
+        let rule = match opt_str(args, "rule") {
+            Some(rule) => rule.trim().to_string(),
+            None => {
+                return Ok(CallToolResult::error(
+                    "'rule' is required unless delete is true",
+                ))
+            }
+        };
+        if let Err(problem) = validate_custom_rule(&rule, &name) {
+            return Ok(CallToolResult::error(format!(
+                "Rule '{name}' not written: {problem}"
+            )));
+        }
+        if previous.is_some() {
+            (upsert_named_rule(&content, &name, &rule), "replaced")
+        } else {
+            let mut block = String::new();
+            if let Some(comment) = opt_str(args, "comment") {
+                for line in comment.lines() {
+                    block.push_str("# ");
+                    block.push_str(line.trim_end());
+                    block.push('\n');
+                }
+            }
+            block.push_str(&rule);
+            (upsert_named_rule(&content, &name, &block), "added")
+        }
+    };
+    let new_content = if new_content.trim_start().starts_with("(version") {
+        new_content
+    } else {
+        format!("(version 1)\n\n{}", new_content.trim_start())
+    };
+    write_atomic(&rules_path, &new_content)?;
+
+    Ok(CallToolResult::text(
+        serde_json::to_string(&json!({
+            "success": true,
+            "rule": name,
+            "action": action,
+            "rules_file": rules_path,
+            "previous": previous
+        }))
+        .unwrap(),
+    ))
+}
+
 // ─── Check clearance ─────────────────────────────────────────────────────────
 
 async fn handle_check_clearance(
@@ -1850,6 +2019,78 @@ mod tests {
         assert!(rules.contains("(constraint clearance (min 0.25mm))"));
         assert!(rules.contains("(constraint track_width (min 0.25mm))"));
         assert!(rules.contains("(layer \"F.Cu\")"));
+    }
+
+    #[tokio::test]
+    async fn set_custom_rule_replaces_adds_and_deletes_one_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        tokio::fs::write(&board, blank_board()).await.unwrap();
+        let rules_path = dir.path().join("board.kicad_dru");
+        let original = "(version 1)\n\n# keep me\n(rule \"a\"\n\t(condition \"A.NetName == '/X'\")\n\t(constraint clearance (min 0.15mm)))\n\n# other\n(rule \"b\"\n\t(constraint min_resolved_spokes 1))\n";
+        tokio::fs::write(&rules_path, original).await.unwrap();
+
+        let replaced = handle_set_custom_rule(
+            &json!({"board": board, "name": "a",
+                    "rule": "(rule \"a\"\n\t(condition \"A.Type != 'Zone' && A.NetName == '/X'\")\n\t(constraint clearance (min 0.15mm)))"}),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!replaced.is_error);
+        let text = tokio::fs::read_to_string(&rules_path).await.unwrap();
+        assert!(text.contains("# keep me\n(rule \"a\"\n\t(condition \"A.Type != 'Zone'"));
+        assert!(text.contains("# other\n(rule \"b\""));
+        assert_eq!(text.matches("(rule \"a\"").count(), 1);
+
+        let added = handle_set_custom_rule(
+            &json!({"board": board, "name": "c", "comment": "why c\nexists",
+                    "rule": "(rule \"c\" (constraint track_width (min 0.2mm)))"}),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!added.is_error);
+        let text = tokio::fs::read_to_string(&rules_path).await.unwrap();
+        assert!(text.contains("# why c\n# exists\n(rule \"c\" (constraint track_width (min 0.2mm)))"));
+
+        let deleted = handle_set_custom_rule(
+            &json!({"board": board, "name": "b", "delete": true}),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!deleted.is_error);
+        let text = tokio::fs::read_to_string(&rules_path).await.unwrap();
+        assert!(!text.contains("(rule \"b\""));
+        assert!(text.contains("(rule \"a\""));
+        assert!(text.contains("(rule \"c\""));
+        assert!(text.starts_with("(version 1)"));
+    }
+
+    #[tokio::test]
+    async fn set_custom_rule_refuses_malformed_rules_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        tokio::fs::write(&board, blank_board()).await.unwrap();
+        let rules_path = dir.path().join("board.kicad_dru");
+        let original = "(version 1)\n\n(rule \"a\" (constraint clearance (min 0.2mm)))\n";
+        tokio::fs::write(&rules_path, original).await.unwrap();
+        for (name, rule) in [
+            ("a", "(rule \"a\" (constraint clearance (min 0.2mm))"),
+            ("a", "(rule \"b\" (constraint clearance (min 0.2mm)))"),
+            ("a", "(rule \"a\" (constraint clearance (min 0.2mm))) (extra)"),
+            ("a", "(rule \"a\" (condition \"unterminated))"),
+        ] {
+            let result = handle_set_custom_rule(
+                &json!({"board": board, "name": name, "rule": rule}),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+            assert!(result.is_error, "accepted {rule}");
+        }
+        assert_eq!(tokio::fs::read_to_string(&rules_path).await.unwrap(), original);
     }
 
     /// #410 stage 1: the number is the distance between two placement
