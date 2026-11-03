@@ -109,6 +109,17 @@ pub fn tools() -> Vec<ToolDef> {
                     "unit": {
                         "type": "integer",
                         "description": "Which placed unit field_placements applies to. Required when x or y is given and the component has more than one placed unit, because a field position is absolute and one coordinate cannot be right for several placements."
+                    },
+                    "attributes": {
+                        "type": "object",
+                        "description": "Symbol flags to set on every placed unit, each true or false: dnp (Do not populate), in_bom, on_board, exclude_from_sim. Read back from the committed file; update_pcb_from_schematic carries dnp and in_bom to the footprint.",
+                        "properties": {
+                            "dnp": { "type": "boolean" },
+                            "in_bom": { "type": "boolean" },
+                            "on_board": { "type": "boolean" },
+                            "exclude_from_sim": { "type": "boolean" }
+                        },
+                        "additionalProperties": false
                     }
                 },
                 "required": ["schematic", "reference"]
@@ -2400,6 +2411,109 @@ pub(crate) fn set_property_value(
     ))
 }
 
+/// The symbol flags `edit_schematic_component` may set through `attributes`.
+/// Each is a direct child of a placed symbol, written `(name yes|no)` by
+/// KiCad 10 on every instance, and each is read back from the committed file
+/// through the schematic model.
+const SYMBOL_FLAGS: [&str; 4] = ["dnp", "in_bom", "on_board", "exclude_from_sim"];
+
+/// Where the value atom of a symbol block's own `(flag …)` child sits, as a
+/// byte range of `content`. Only direct children count: a property or a pin
+/// nested deeper never matches, and quoted text is skipped so a field whose
+/// value reads "(dnp yes)" cannot be mistaken for the flag.
+fn symbol_flag_value_span(
+    content: &str,
+    start: usize,
+    end: usize,
+    flag: &str,
+) -> Option<(usize, usize)> {
+    let bytes = content.as_bytes();
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut index = start;
+    while index < end {
+        let byte = bytes[index];
+        if in_string {
+            if byte == b'\\' {
+                index += 2;
+                continue;
+            }
+            if byte == b'"' {
+                in_string = false;
+            }
+        } else if byte == b'"' {
+            in_string = true;
+        } else if byte == b'(' {
+            depth += 1;
+            if depth == 2 {
+                let name_start = index + 1;
+                let rest = &content[name_start..end];
+                if let Some(after) = rest.strip_prefix(flag) {
+                    if after.starts_with([' ', '\t', '\r', '\n']) {
+                        let value_start = name_start
+                            + flag.len()
+                            + (after.len() - after.trim_start().len());
+                        let value_len = content[value_start..end]
+                            .find(|c: char| c == ')' || c.is_whitespace())?;
+                        return Some((value_start, value_start + value_len));
+                    }
+                }
+            }
+        } else if byte == b')' {
+            depth = depth.saturating_sub(1);
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Set one symbol flag (`dnp`, `in_bom`, …) on every placed unit. Returns the
+/// new text and how many units actually changed; a unit already carrying the
+/// requested value is left byte for byte as it was. A unit without the flag
+/// is refused rather than patched, since KiCad 10 writes all four on every
+/// instance and a missing one means the block is not what this edit expects.
+fn set_symbol_flag(
+    content: &str,
+    reference: &str,
+    flag: &str,
+    value: bool,
+) -> Result<(String, usize), String> {
+    let blocks = find_all_symbol_instance_blocks(content, reference);
+    if blocks.is_empty() {
+        return Err(format!("symbol '{reference}' not found in this schematic"));
+    }
+    let wanted = if value { "yes" } else { "no" };
+    let mut edits = Vec::new();
+    for (start, end) in blocks {
+        let (value_start, value_end) = symbol_flag_value_span(content, start, end, flag)
+            .ok_or_else(|| {
+                format!("'{reference}' has no ({flag} …) flag on one of its placed units")
+            })?;
+        match &content[value_start..value_end] {
+            current if current == wanted => {}
+            "yes" | "no" => edits.push(SexpEdit::replace(value_start, value_end, wanted.to_string())),
+            other => {
+                return Err(format!(
+                    "'{reference}' has ({flag} {other}), expected yes or no"
+                ))
+            }
+        }
+    }
+    let changed = edits.len();
+    Ok((apply_edits(content.to_string(), edits), changed))
+}
+
+/// A placed symbol's flag as the schematic model reads it.
+fn symbol_flag(symbol: &cse::Symbol, flag: &str) -> Option<bool> {
+    match flag {
+        "dnp" => Some(symbol.dnp),
+        "in_bom" => Some(symbol.in_bom),
+        "on_board" => Some(symbol.on_board),
+        "exclude_from_sim" => symbol.exclude_from_sim,
+        _ => None,
+    }
+}
+
 /// What `edit_schematic_component` may change about where a field's text sits.
 /// Every part is optional: an absent one leaves the file's value alone rather
 /// than defaulting, so moving a field cannot silently unhide it.
@@ -2903,6 +3017,44 @@ async fn handle_edit_schematic_component(
         }
     }
 
+    // Symbol flags (DNP, BOM, board, simulation). A flag already at the
+    // requested value is reported as unchanged, not as a failure: asking for
+    // the state the part is in is a valid request.
+    let attributes = args["attributes"].as_object();
+    let mut requested_flags: Vec<(String, bool)> = Vec::new();
+    let mut unchanged_flags: Vec<String> = Vec::new();
+    if let Some(attributes) = attributes {
+        for (name, value) in attributes {
+            if !SYMBOL_FLAGS.contains(&name.as_str()) {
+                errors.push(format!(
+                    "attributes.{name}: unknown flag; expected one of {}",
+                    SYMBOL_FLAGS.join(", ")
+                ));
+                continue;
+            }
+            let Some(value) = value.as_bool() else {
+                errors.push(format!("attributes.{name}: expected true or false"));
+                continue;
+            };
+            match set_symbol_flag(&content, edit_reference, name, value) {
+                Ok((updated, 0)) => {
+                    content = updated;
+                    requested_flags.push((name.clone(), value));
+                    unchanged_flags.push(name.clone());
+                }
+                Ok((updated, units)) => {
+                    content = updated;
+                    requested_flags.push((name.clone(), value));
+                    changed.push(format!(
+                        "{name} → {} ({units} unit(s))",
+                        if value { "yes" } else { "no" }
+                    ));
+                }
+                Err(why) => errors.push(format!("attributes.{name}: {why}")),
+            }
+        }
+    }
+
     // A request that changed nothing is a failure, not a success — silently
     // reporting `"changes": []` is what let the tab-indentation bug hide, and
     // what made a fields-only call report success while dropping every field
@@ -2910,7 +3062,8 @@ async fn handle_edit_schematic_component(
     // empty and this guard never fired.
     if changed.is_empty()
         && (custom_fields.is_some_and(|f| !f.is_empty())
-            || placements.is_some_and(|p| !p.is_empty()))
+            || placements.is_some_and(|p| !p.is_empty())
+            || (attributes.is_some_and(|a| !a.is_empty()) && unchanged_flags.is_empty()))
         && errors.is_empty()
     {
         return Ok(CallToolResult::error(format!(
@@ -2963,6 +3116,38 @@ async fn handle_edit_schematic_component(
         result["requested_reference"] = json!(reference);
     }
     copy_component_observation(&mut result, &observed);
+    if !requested_flags.is_empty() {
+        // Read the flags back from the committed file through the schematic
+        // model, independently of the text edit that wrote them.
+        let committed = cse::Schematic::load(&sch_path)?;
+        let placed: Vec<&cse::Symbol> = committed
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.reference() == Some(edit_reference))
+            .collect();
+        let mut seen = serde_json::Map::new();
+        let mut missed = Vec::new();
+        for (name, wanted) in &requested_flags {
+            let values: Vec<Option<bool>> =
+                placed.iter().map(|symbol| symbol_flag(symbol, name)).collect();
+            if placed.is_empty() || values.iter().any(|value| *value != Some(*wanted)) {
+                missed.push(name.clone());
+            }
+            seen.insert(name.clone(), json!(values));
+        }
+        result["attributes"] = serde_json::Value::Object(seen);
+        if !unchanged_flags.is_empty() {
+            result["attributes_unchanged"] = json!(unchanged_flags);
+        }
+        if !missed.is_empty() {
+            return Ok(CallToolResult::error(format!(
+                "'{reference}' was written but the committed file does not show {} as requested; \
+                 inspect it before retrying: {}",
+                missed.join(", "),
+                serde_json::Value::Object(result["attributes"].as_object().cloned().unwrap_or_default())
+            )));
+        }
+    }
     if !errors.is_empty() {
         result["errors"] = json!(errors);
     }
@@ -8118,6 +8303,94 @@ mod multi_unit_component_tests {
             source.matches("(property \"MPN\" \"A\\\\\\\"B\"").count(),
             2
         );
+    }
+
+    /// The DNP flag of every U1 unit in a real eeschema save, read through
+    /// the schematic model.
+    fn u1_flags(path: &std::path::Path, flag: &str) -> Vec<Option<bool>> {
+        cse::Schematic::load(path)
+            .unwrap()
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.reference() == Some("U1"))
+            .map(|symbol| symbol_flag(symbol, flag))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn attributes_set_dnp_on_every_unit_and_nothing_else() {
+        let (_directory, path) = eeschema_fixture();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let others_before = before.matches("(dnp no)").count();
+        let units = u1_flags(&path, "dnp").len();
+        assert!(units > 1, "the fixture places U1 more than once");
+
+        let result = handle_edit_schematic_component(
+            &json!({
+                "schematic": path,
+                "reference": "U1",
+                "attributes": { "dnp": true, "in_bom": false }
+            }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let response = body(result);
+        assert_eq!(response["attributes"]["dnp"], json!(vec![true; units]));
+        assert_eq!(response["attributes"]["in_bom"], json!(vec![false; units]));
+
+        assert_eq!(u1_flags(&path, "dnp"), vec![Some(true); units]);
+        assert_eq!(u1_flags(&path, "in_bom"), vec![Some(false); units]);
+        assert_eq!(u1_flags(&path, "on_board"), vec![Some(true); units]);
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after.matches("(dnp yes)").count(), units);
+        assert_eq!(
+            after.matches("(dnp no)").count(),
+            others_before - units,
+            "only U1's flags may change"
+        );
+    }
+
+    #[tokio::test]
+    async fn attributes_already_in_place_are_reported_unchanged_not_refused() {
+        let (_directory, path) = eeschema_fixture();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let result = handle_edit_schematic_component(
+            &json!({ "schematic": path, "reference": "U1", "attributes": { "dnp": false } }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let response = body(result);
+        assert_eq!(response["attributes_unchanged"], json!(["dnp"]));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_or_non_boolean_attribute_changes_nothing() {
+        let (_directory, path) = eeschema_fixture();
+        let before = std::fs::read_to_string(&path).unwrap();
+        for attributes in [json!({ "populate": true }), json!({ "dnp": "yes" })] {
+            let result = handle_edit_schematic_component(
+                &json!({ "schematic": path, "reference": "U1", "attributes": attributes }),
+                &context(),
+            )
+            .await
+            .unwrap();
+            assert!(result.is_error, "{attributes} must be refused: {result:?}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn a_flag_inside_quoted_text_or_a_nested_node_is_not_the_symbols_flag() {
+        let block = "(symbol\n\t(lib_id \"Device:R\")\n\t(property \"Note\" \"(dnp yes)\"\n\t\t(dnp yes)\n\t)\n\t(dnp no)\n)";
+        let (start, end) = symbol_flag_value_span(block, 0, block.len(), "dnp").unwrap();
+        assert_eq!(&block[start..end], "no");
+        assert_eq!(start, block.rfind("(dnp no)").unwrap() + "(dnp ".len());
+        assert!(symbol_flag_value_span(block, 0, block.len(), "in_bom").is_none());
     }
 
     #[tokio::test]
