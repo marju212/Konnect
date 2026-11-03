@@ -151,7 +151,9 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "edit_footprint_pad",
-            "Edit the size, shape, position, drill, or zone connection of a pad in an existing .kicad_mod footprint file.",
+            "Edit the size, shape, position, drill, or zone connection of a pad in an existing .kicad_mod footprint file, \
+             or delete it. `at` picks one pad among several with the same number (such as a footprint's unnumbered \
+             solder-paste apertures) by its current position.",
             json!({
                 "type": "object",
                 "properties": {
@@ -169,10 +171,29 @@ pub fn tools() -> Vec<ToolDef> {
                         "description": "New standard pad shape (optional). roundrect gets a valid default corner ratio when needed."
                     },
                     "drill": { "type": "number", "description": "New drill diameter in mm (optional)" },
+                    "drill_slot": {
+                        "type": "object",
+                        "description": "New oval (slot) drill {width, height} in mm, written as (drill oval W H); not together with drill",
+                        "properties": { "width": { "type": "number" }, "height": { "type": "number" } },
+                        "required": ["width", "height"],
+                        "additionalProperties": false
+                    },
                     "zone_connect": {
                         "type": "string",
                         "enum": ["inherited", "solid", "thermal", "none"],
                         "description": "How copper zones connect to this pad (optional; omit it to leave the pad as it is). 'solid', 'thermal' and 'none' write the pad's own override; 'inherited' removes it so the pad follows its footprint and zone settings."
+                    },
+                    "at": {
+                        "type": "object",
+                        "description": "Select only the pad with this number whose current position is {x, y} (footprint coordinates, mm, within 0.001). Refused together with match_all.",
+                        "properties": { "x": { "type": "number" }, "y": { "type": "number" } },
+                        "required": ["x", "y"],
+                        "additionalProperties": false
+                    },
+                    "delete": {
+                        "type": "boolean",
+                        "description": "Remove the selected pad (or every match with match_all) instead of editing it; no other edit field may be given",
+                        "default": false
                     }
                 },
                 "required": ["footprint_path", "pad_number"]
@@ -978,6 +999,53 @@ async fn handle_edit_footprint_pad(
             }
         },
     };
+    let at = match args.get("at") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => match (
+            value.get("x").and_then(serde_json::Value::as_f64),
+            value.get("y").and_then(serde_json::Value::as_f64),
+        ) {
+            (Some(x), Some(y)) => Some((x, y)),
+            _ => return Ok(invalid_library_argument("at", "must be an object with numeric x and y")),
+        },
+    };
+    if at.is_some() && match_all {
+        return Ok(invalid_library_argument(
+            "at",
+            "selects one pad by position and cannot be combined with match_all",
+        ));
+    }
+    let delete = match args.get("delete") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(value) => match value.as_bool() {
+            Some(delete) => delete,
+            None => return Ok(invalid_library_argument("delete", "must be a boolean when supplied")),
+        },
+    };
+    if args.get("drill").is_some() && args.get("drill_slot").is_some() {
+        return Ok(invalid_library_argument(
+            "drill_slot",
+            "give either drill (round) or drill_slot (oval), not both",
+        ));
+    }
+    if let Some(slot) = args.get("drill_slot") {
+        let valid = |key: &str| slot.get(key).and_then(serde_json::Value::as_f64).is_some_and(|v| v > 0.0);
+        if !valid("width") || !valid("height") {
+            return Ok(invalid_library_argument(
+                "drill_slot",
+                "must be an object with positive numeric width and height",
+            ));
+        }
+    }
+    if delete {
+        let edit_fields = ["new_number", "x", "y", "width", "height", "shape", "drill", "drill_slot", "zone_connect"];
+        if let Some(field) = edit_fields.iter().find(|field| args.get(**field).is_some()) {
+            return Ok(invalid_library_argument(
+                field,
+                "cannot be combined with delete: a deleted pad is not edited",
+            ));
+        }
+    }
 
     let content = read_consistent(&path)?;
     match parse_sexp(&content) {
@@ -1011,8 +1079,28 @@ async fn handle_edit_footprint_pad(
         {
             continue;
         }
+        if let Some((x, y)) = at {
+            let position = node
+                .find("at")
+                .and_then(|at| Some((at.get_f64(1)?, at.get_f64(2)?)));
+            match position {
+                Some((px, py)) if (px - x).abs() <= 0.001 && (py - y).abs() <= 0.001 => {}
+                _ => continue,
+            }
+        }
 
         matched_count += 1;
+        if delete {
+            // Take the pad's own line with it, so no blank line is left behind.
+            let line_start = content[..start].rfind('\n').map_or(start, |newline| {
+                if content[newline + 1..start].trim().is_empty() { newline } else { start }
+            });
+            edits.push(SexpEdit::replace(line_start, end, ""));
+            if !match_all {
+                break;
+            }
+            continue;
+        }
         let mut edited = match edit_footprint_pad_block(block, args, new_number, shape) {
             Ok(edited) => edited,
             Err(reason) => return Ok(invalid_library_argument("shape", reason)),
@@ -1031,8 +1119,11 @@ async fn handle_edit_footprint_pad(
 
     if matched_count == 0 {
         return Ok(invalid_library_argument(
-            "pad_number",
-            format!("pad '{pad_number}' was not found"),
+            if at.is_some() { "at" } else { "pad_number" },
+            match at {
+                Some((x, y)) => format!("no pad '{pad_number}' sits at ({x}, {y})"),
+                None => format!("pad '{pad_number}' was not found"),
+            },
         ));
     }
 
@@ -1044,7 +1135,8 @@ async fn handle_edit_footprint_pad(
         "pad": pad_number,
         "shape": shape,
         "matched_count": matched_count,
-        "updated_count": matched_count
+        "updated_count": if delete { 0 } else { matched_count },
+        "deleted_count": if delete { matched_count } else { 0 }
     });
     // Read off the pads as written, not echoed from the request.
     observed_zone_connects.dedup();
@@ -1380,16 +1472,24 @@ fn edit_footprint_pad_block(
             new_pad.replace_range(size_pos..size_end, &format!("(size {width} {height})"));
         }
     }
-    if let Some(drill) = args["drill"].as_f64() {
+    let slot = args.get("drill_slot").and_then(|slot| {
+        Some((slot.get("width")?.as_f64()?, slot.get("height")?.as_f64()?))
+    });
+    let drill_text = match (args["drill"].as_f64(), slot) {
+        (Some(drill), _) => Some(format!("(drill {drill})")),
+        (None, Some((width, height))) => Some(format!("(drill oval {width} {height})")),
+        (None, None) => None,
+    };
+    if let Some(drill_text) = drill_text {
         if let Some(drill_pos) = new_pad.find("(drill ") {
             let drill_end = new_pad[drill_pos..]
                 .find(')')
                 .map(|i| drill_pos + i + 1)
                 .unwrap_or(new_pad.len());
-            new_pad.replace_range(drill_pos..drill_end, &format!("(drill {drill})"));
+            new_pad.replace_range(drill_pos..drill_end, &drill_text);
         } else {
             let insert_at = new_pad.rfind(')').unwrap_or(new_pad.len());
-            new_pad.insert_str(insert_at, &format!(" (drill {drill})"));
+            new_pad.insert_str(insert_at, &format!(" {drill_text}"));
         }
     }
 
@@ -10212,5 +10312,84 @@ mod required_argument_tests {
         assert!(result.is_error);
         assert_eq!(error_field(&result), "units[0].pins[1].name");
         assert!(!path.exists(), "no library may be created on rejection");
+    }
+}
+
+#[cfg(test)]
+mod pad_select_and_delete_tests {
+    use super::*;
+
+    const PASTE: &str = "(footprint \"QFN\"\n\t(layer \"F.Cu\")\n\t(pad \"1\" smd roundrect\n\t\t(at -4.9 -3.6)\n\t\t(size 0.8 0.2)\n\t\t(layers \"F.Cu\" \"F.Mask\" \"F.Paste\")\n\t\t(roundrect_rratio 0.25)\n\t)\n\t(pad \"\" smd roundrect\n\t\t(at -1.13 -1.13)\n\t\t(size 0.91 0.91)\n\t\t(layers \"F.Paste\")\n\t\t(roundrect_rratio 0.25)\n\t)\n\t(pad \"\" smd roundrect\n\t\t(at 0 0)\n\t\t(size 0.91 0.91)\n\t\t(layers \"F.Paste\")\n\t\t(roundrect_rratio 0.25)\n\t)\n\t(pad \"\" smd roundrect\n\t\t(at 1.13 1.13)\n\t\t(size 0.91 0.91)\n\t\t(layers \"F.Paste\")\n\t\t(roundrect_rratio 0.25)\n\t)\n)\n";
+
+    async fn call(path: &std::path::Path, args: serde_json::Value) -> CallToolResult {
+        let mut args = args;
+        args["footprint_path"] = json!(path.display().to_string());
+        let ctx = ToolContext::new(
+            crate::tools::ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+        handle_edit_footprint_pad(&args, &ctx).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn at_selects_one_unnumbered_paste_pad_and_delete_removes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().join("QFN.kicad_mod");
+        std::fs::write(&fp, PASTE).unwrap();
+
+        let moved = call(&fp, json!({ "pad_number": "", "at": { "x": 1.13, "y": 1.13 }, "x": 1.0, "y": 1.0, "width": 1.2, "height": 1.2 })).await;
+        assert!(!moved.is_error, "{moved:?}");
+        let written = std::fs::read_to_string(&fp).unwrap();
+        assert!(written.contains("(at 1 1)") || written.contains("(at 1.0 1.0)"), "{written}");
+        assert!(written.contains("(at -1.13 -1.13)") && written.contains("(at 0 0)"), "{written}");
+
+        let deleted = call(&fp, json!({ "pad_number": "", "at": { "x": 0.0, "y": 0.0 }, "delete": true })).await;
+        assert!(!deleted.is_error, "{deleted:?}");
+        let written = std::fs::read_to_string(&fp).unwrap();
+        assert_eq!(written.matches("(pad \"\"").count(), 2, "{written}");
+        assert!(!written.contains("(at 0 0)"), "{written}");
+        assert!(!written.contains("\n\n"), "a blank line was left behind: {written}");
+        assert!(written.contains("(pad \"1\""), "{written}");
+        parse_sexp(&written).unwrap();
+    }
+
+    #[tokio::test]
+    async fn drill_slot_writes_an_oval_drill_on_the_selected_shell_pad() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().join("USB.kicad_mod");
+        let source = "(footprint \"USB\"\n\t(pad \"SH\" thru_hole oval\n\t\t(at -4.32 -3.13 270)\n\t\t(size 1 2.1)\n\t\t(drill oval 0.6 1.7)\n\t\t(layers \"*.Cu\" \"*.Mask\")\n\t)\n\t(pad \"SH\" thru_hole oval\n\t\t(at -4.32 1.05 270)\n\t\t(size 1 1.6)\n\t\t(drill oval 0.6 1.2)\n\t\t(layers \"*.Cu\" \"*.Mask\")\n\t)\n)\n";
+        std::fs::write(&fp, source).unwrap();
+        let result = call(&fp, json!({ "pad_number": "SH", "at": { "x": -4.32, "y": 1.05 }, "height": 1.8, "drill_slot": { "width": 0.6, "height": 1.4 } })).await;
+        assert!(!result.is_error, "{result:?}");
+        let written = std::fs::read_to_string(&fp).unwrap();
+        assert!(written.contains("(drill oval 0.6 1.4)"), "{written}");
+        assert!(written.contains("(size 1 1.8)"), "{written}");
+        assert!(written.contains("(drill oval 0.6 1.7)") && written.contains("(size 1 2.1)"), "the other pad changed: {written}");
+        let both = call(&fp, json!({ "pad_number": "SH", "drill": 0.8, "drill_slot": { "width": 0.6, "height": 1.4 } })).await;
+        assert!(both.is_error);
+    }
+
+    #[tokio::test]
+    async fn a_missing_position_or_bad_combination_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().join("QFN.kicad_mod");
+        std::fs::write(&fp, PASTE).unwrap();
+        for args in [
+            json!({ "pad_number": "", "at": { "x": 9.0, "y": 9.0 }, "delete": true }),
+            json!({ "pad_number": "", "at": { "x": 0.0, "y": 0.0 }, "match_all": true, "delete": true }),
+            json!({ "pad_number": "", "at": { "x": 0.0, "y": 0.0 }, "delete": true, "width": 1.0 }),
+        ] {
+            let result = call(&fp, args.clone()).await;
+            assert!(result.is_error, "{args} unexpectedly succeeded");
+        }
+        assert_eq!(std::fs::read_to_string(&fp).unwrap(), PASTE);
     }
 }
