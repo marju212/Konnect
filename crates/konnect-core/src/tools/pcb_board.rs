@@ -1272,6 +1272,26 @@ pub fn tools() -> Vec<ToolDef> {
         )
         .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
+            "delete_zone",
+            "Delete one zone (copper pour, keepout or other rule area) from the board KiCad \
+             holds open, selected by its UUID or by its name. A name that matches more than \
+             one zone is refused with the candidates listed, and a UUID that is not a zone is \
+             refused, so nothing but the one observed zone can be deleted. Reads the zones \
+             back to prove it is gone and returns what it was (name, net, layers, priority) \
+             for the undo record. Other zones are not refilled: refill before judging copper.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string", "description": "Path to .kicad_pcb file" },
+                    "uuid":  { "type": "string", "description": "UUID of the zone (give this or name)" },
+                    "name":  { "type": "string", "description": "Zone name as pcbnew shows it (give this or uuid)" }
+                },
+                "required": ["board"]
+            }),
+            |args, ctx| async move { handle_delete_zone(args, ctx).await }
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
+        tool!(
             "import_svg_logo",
             "Import an SVG file as filled silkscreen or copper artwork (a logo, icon, or other \
              graphic). Curved paths are flattened into polygon outlines since KiCAD's board \
@@ -1506,6 +1526,119 @@ fn paper_name(tree: &SexpNode) -> String {
 fn paper_size_mm(tree: &SexpNode) -> Option<(f64, f64)> {
     let paper = tree.find("paper")?;
     Some((paper.get_f64(2)?, paper.get_f64(3)?))
+}
+
+fn zone_json(zone: &konnect_ipc::IpcZonePreimage) -> serde_json::Value {
+    json!({
+        "uuid": zone.uuid,
+        "name": zone.name,
+        "net": zone.net_name,
+        "layers": zone.layers,
+        "priority": zone.priority,
+        "rule_area": zone.rule_area,
+    })
+}
+
+async fn handle_delete_zone(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board = get_path(args, "board")?;
+    let uuid = args.get("uuid").and_then(|v| v.as_str()).map(str::to_string);
+    let name = args.get("name").and_then(|v| v.as_str()).map(str::to_string);
+    let uuid = match (uuid, name) {
+        (Some(uuid), None) => uuid,
+        (None, Some(name)) => {
+            let zones = match with_board_ipc_classified(ctx, &board, |client, document| {
+                client.list_zones_in(document)
+            })
+            .await?
+            {
+                Ok(zones) => zones,
+                Err(error) => {
+                    return Ok(CallToolResult::error(format!(
+                        "KiCAD must be running with the board loaded (IPC error: {})",
+                        error.message()
+                    )))
+                }
+            };
+            let matching: Vec<_> = zones.iter().filter(|zone| zone.name == name).collect();
+            match matching.as_slice() {
+                [only] => only.uuid.clone(),
+                [] => {
+                    return Ok(CallToolResult::error_kind(
+                        ToolErrorKind::StaleTarget {
+                            target: name.clone(),
+                            reason: "no zone on the requested board has this name".to_string(),
+                        },
+                        format!(
+                            "No zone named '{name}' on the requested board. No board item was deleted."
+                        ),
+                    ))
+                }
+                several => {
+                    let candidates = several
+                        .iter()
+                        .map(|zone| {
+                            format!("{} ({} on {})", zone.uuid, zone.net_name, zone.layers.join(","))
+                        })
+                        .collect::<Vec<_>>();
+                    return Ok(CallToolResult::error_kind(
+                        ToolErrorKind::AmbiguousTarget {
+                            target: name.clone(),
+                            candidates: candidates.clone(),
+                        },
+                        format!(
+                            "{} zones are named '{name}'; pass one of their UUIDs: {}. No board item was deleted.",
+                            several.len(),
+                            candidates.join("; ")
+                        ),
+                    ));
+                }
+            }
+        }
+        _ => {
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::InvalidArgument {
+                    field: "uuid".to_string(),
+                    reason: "give exactly one of uuid and name".to_string(),
+                },
+                "Give exactly one of 'uuid' and 'name' to select the zone. No board item was deleted.",
+            ))
+        }
+    };
+
+    let board_ipc = board.clone();
+    let uuid_ipc = uuid.clone();
+    let deleted = match with_board_ipc_classified(ctx, &board, move |client, _| {
+        client.delete_zone_verified(&board_ipc, &uuid_ipc)
+    })
+    .await?
+    {
+        Ok(deleted) => deleted,
+        Err(error) => {
+            return Ok(CallToolResult::error(format!(
+                "KiCAD must be running with the board loaded (IPC error: {})",
+                error.message()
+            )))
+        }
+    };
+    let Some(zone) = deleted else {
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::StaleTarget {
+                target: uuid,
+                reason: "the UUID is not an observed zone on the requested board".to_string(),
+            },
+            "The requested UUID is not a zone on the requested board. No board item was deleted.",
+        ));
+    };
+    Ok(CallToolResult::json(&json!({
+        "deleted_uuid": zone.uuid,
+        "deleted_type": "zone",
+        "preimage": zone_json(&zone),
+        "postcondition": "absent_from_zone_readback",
+        "zones_refilled": false
+    })))
 }
 
 async fn handle_get_board_info(
@@ -5685,5 +5818,167 @@ mod single_board_lookup_tests {
             ],
             "every board command names the document GetOpenDocuments returned"
         );
+    }
+}
+
+#[cfg(test)]
+mod delete_zone_tests {
+    use super::*;
+    use crate::tools::pcb_board::board_mock::{ctx_talking_to, spawn_kicad_holding_board};
+    use konnect_ipc::gen::kiapi;
+    use prost::Message;
+    use std::sync::{Arc, Mutex};
+
+    fn zone(uuid: &str, name: &str, net: &str) -> prost_types::Any {
+        let points = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)];
+        let spec = konnect_ipc::builders::ZoneSpec {
+            layer: "F.Cu",
+            net_name: net,
+            points: &points,
+            clearance_mm: 0.2,
+            min_thickness_mm: 0.2,
+            name,
+            priority: 3,
+            connection: kiapi::board::types::ZoneConnectionStyle::ZcsFull,
+        };
+        let mut zone = konnect_ipc::builders::build_zone(&spec, 0);
+        zone.id = Some(kiapi::common::types::Kiid {
+            value: uuid.to_string(),
+        });
+        konnect_ipc::builders::pack_any(&zone, "kiapi.board.types.Zone")
+    }
+
+    /// A mock KiCad holding `zones`. DeleteItems removes the named UUIDs and is
+    /// counted, so a test can prove that nothing was deleted.
+    fn kicad_with(
+        board: &std::path::Path,
+        zones: Vec<(String, prost_types::Any)>,
+    ) -> (crate::test_support::MockIpcServer, Arc<Mutex<usize>>) {
+        let held = Arc::new(Mutex::new(zones));
+        let deletes = Arc::new(Mutex::new(0usize));
+        let (held_in, deletes_in) = (held.clone(), deletes.clone());
+        let server = spawn_kicad_holding_board(board, move |command| {
+            if command.type_url.ends_with("GetItems") {
+                let items = held_in
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|(_, any)| any.clone())
+                    .collect();
+                return Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::GetItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        items,
+                    },
+                    "kiapi.common.commands.GetItemsResponse",
+                ));
+            }
+            if command.type_url.ends_with("DeleteItems") {
+                *deletes_in.lock().unwrap() += 1;
+                let request =
+                    kiapi::common::commands::DeleteItems::decode(command.value.as_slice()).unwrap();
+                let gone: Vec<String> = request.item_ids.iter().map(|id| id.value.clone()).collect();
+                held_in.lock().unwrap().retain(|(uuid, _)| !gone.contains(uuid));
+                return Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::DeleteItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        deleted_items: vec![],
+                    },
+                    "kiapi.common.commands.DeleteItemsResponse",
+                ));
+            }
+            None
+        });
+        (server, deletes)
+    }
+
+    fn body(result: &CallToolResult) -> serde_json::Value {
+        match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => {
+                serde_json::from_str(text).unwrap()
+            }
+            other => panic!("expected text result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_unique_name_deletes_that_zone_and_reports_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("target.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (version 20260206))").unwrap();
+        let (server, deletes) = kicad_with(
+            &board,
+            vec![
+                ("z-lx".into(), zone("z-lx", "REG_LX", "/VREG_LX")),
+                ("z-gnd".into(), zone("z-gnd", "GND_TOP", "GND")),
+            ],
+        );
+        let result = handle_delete_zone(
+            &json!({ "board": board.to_string_lossy(), "name": "REG_LX" }),
+            &ctx_talking_to(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let body = body(&result);
+        assert_eq!(body["deleted_type"], json!("zone"));
+        assert_eq!(body["deleted_uuid"], json!("z-lx"));
+        assert_eq!(body["preimage"]["name"], json!("REG_LX"));
+        assert_eq!(body["preimage"]["priority"], json!(3));
+        assert_eq!(body["preimage"]["layers"], json!(["F.Cu"]));
+        assert_eq!(*deletes.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_shared_name_is_refused_with_candidates_and_nothing_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("target.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (version 20260206))").unwrap();
+        let (server, deletes) = kicad_with(
+            &board,
+            vec![
+                ("z-1".into(), zone("z-1", "GND_TOP", "GND")),
+                ("z-2".into(), zone("z-2", "GND_TOP", "GND")),
+            ],
+        );
+        let result = handle_delete_zone(
+            &json!({ "board": board.to_string_lossy(), "name": "GND_TOP" }),
+            &ctx_talking_to(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("ambiguous_target")
+        );
+        assert_eq!(*deletes.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn non_zone_uuids_unknown_names_and_bad_selectors_delete_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("target.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (version 20260206))").unwrap();
+        let (server, deletes) = kicad_with(&board, vec![("z-1".into(), zone("z-1", "A", "GND"))]);
+        let ctx = ctx_talking_to(server.address().to_string());
+        let path = board.to_string_lossy().to_string();
+        for (args, kind) in [
+            (json!({ "board": path, "uuid": "track-1" }), "stale_target"),
+            (json!({ "board": path, "name": "B" }), "stale_target"),
+            (json!({ "board": path }), "invalid_argument"),
+            (json!({ "board": path, "uuid": "z-1", "name": "A" }), "invalid_argument"),
+        ] {
+            let result = handle_delete_zone(&args, &ctx).await.unwrap();
+            assert!(result.is_error, "{args} unexpectedly succeeded");
+            assert_eq!(
+                crate::mcp::error::extract_error_kind(&result).as_deref(),
+                Some(kind),
+                "{args}"
+            );
+        }
+        assert_eq!(*deletes.lock().unwrap(), 0);
     }
 }

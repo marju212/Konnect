@@ -244,6 +244,20 @@ impl std::fmt::Display for IpcSelectionObservationError {
 impl std::error::Error for IpcSelectionObservationError {}
 
 
+/// What a zone (copper pour or rule area) on the board is, as observed before
+/// a deletion: enough for the caller to recognise it and to recreate it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IpcZonePreimage {
+    pub uuid: String,
+    /// The name pcbnew shows in the zone properties; empty when unnamed.
+    pub name: String,
+    /// Net of a copper zone; empty for a rule area or an unconnected pour.
+    pub net_name: String,
+    pub layers: Vec<String>,
+    pub priority: u32,
+    pub rule_area: bool,
+}
+
 /// What a deleted via was, for the caller's undo record.
 #[derive(Debug, Clone, PartialEq)]
 pub struct IpcViaPreimage {

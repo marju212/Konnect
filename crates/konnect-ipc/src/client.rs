@@ -131,6 +131,30 @@ fn pad_geometry(pad: &kiapi::board::types::Pad) -> PadGeometry {
 }
 
 /// Map a BoardLayer enum integer back to a KiCAD layer name string.
+fn zone_preimage(zone: &kiapi::board::types::Zone) -> IpcZonePreimage {
+    use kiapi::board::types::zone::Settings;
+    let net_name = match &zone.settings {
+        Some(Settings::CopperSettings(copper)) => copper
+            .net
+            .as_ref()
+            .map(|net| net.name.clone())
+            .unwrap_or_default(),
+        _ => String::new(),
+    };
+    IpcZonePreimage {
+        uuid: zone.id.as_ref().map(|id| id.value.clone()).unwrap_or_default(),
+        name: zone.name.clone(),
+        net_name,
+        layers: zone
+            .layers
+            .iter()
+            .map(|layer| layer_enum_to_name(*layer).to_string())
+            .collect(),
+        priority: zone.priority,
+        rule_area: matches!(zone.settings, Some(Settings::RuleAreaSettings(_))),
+    }
+}
+
 fn layer_enum_to_name(layer: i32) -> &'static str {
     kiapi::board::types::BoardLayer::try_from(layer)
         .ok()
@@ -3012,6 +3036,57 @@ impl KiCadIpcClient {
             net_name: via.net.map(|net| net.name).unwrap_or_default(),
             position: via.position.map(point_in_mm).unwrap_or(IpcVector2 { x: 0.0, y: 0.0 }),
         }))
+    }
+
+    /// Every zone (copper pour or rule area) on one exact open board.
+    pub fn list_zones_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+    ) -> Result<Vec<IpcZonePreimage>> {
+        Ok(self
+            .get_items_in(document, kiapi::common::types::KiCadObjectType::KotPcbZone)?
+            .iter()
+            // KOT_PCB_ZONE is the zone selector, but type-check before decode
+            // for the same reason the trace query does: protobuf decoding is
+            // permissive enough to accept compatible bytes under a wrong type.
+            .filter(|item| crate::builders::any_is(item, "kiapi.board.types.Zone"))
+            .filter_map(|item| kiapi::board::types::Zone::decode(item.value.as_slice()).ok())
+            .map(|zone| zone_preimage(&zone))
+            .collect())
+    }
+
+    /// Delete one zone by UUID, then read the zones back to prove it is gone.
+    /// Returns `Ok(None)` without deleting anything when the UUID is not a
+    /// zone on the requested board, so a footprint, track or graphic UUID can
+    /// never be deleted through this path.
+    pub fn delete_zone_verified(
+        &self,
+        requested: &Path,
+        uuid: &str,
+    ) -> Result<Option<IpcZonePreimage>> {
+        let document = self.find_open_board(requested)?;
+        let Some(zone) = self
+            .list_zones_in(document.clone())?
+            .into_iter()
+            .find(|zone| zone.uuid == uuid)
+        else {
+            return Ok(None);
+        };
+        self.delete_items_in(document.clone(), vec![uuid.to_string()])?;
+        let remains = self
+            .list_zones_in(document)
+            .with_context(|| {
+                format!(
+                    "KiCad accepted deletion of zone '{}' but post-delete read-back failed; the deletion may have committed",
+                    uuid
+                )
+            })?
+            .iter()
+            .any(|candidate| candidate.uuid == uuid);
+        if remains {
+            anyhow::bail!("KiCad accepted deletion of zone '{}' but read-back still reports it", uuid);
+        }
+        Ok(Some(zone))
     }
 
     /// Delete a board item by UUID.
