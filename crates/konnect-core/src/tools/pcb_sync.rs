@@ -337,6 +337,11 @@ struct SyncPlan {
     /// Not part of the plan's identity: `sync_response` reports it.
     #[serde(skip)]
     staging: Option<StagingEvidence>,
+    /// What the apply cannot carry and will drop, reported without blocking
+    /// it: set by the handler from the saved board, not part of the plan's
+    /// identity.
+    #[serde(skip)]
+    warnings: Vec<SyncDiagnostic>,
 }
 
 /// What added footprints were staged beside (#688).
@@ -494,6 +499,7 @@ pub(crate) async fn handle_update_pcb_from_schematic(
     };
     let ipc_board = board.clone();
     let library_board = board.clone();
+    let warning_board = board.clone();
     let result = attempt_ipc_write(
         ctx,
         &board,
@@ -518,6 +524,20 @@ pub(crate) async fn handle_update_pcb_from_schematic(
             }
             restage_additions(&mut plan, &prepared, snapshot.state.bounds);
             refresh_revision_with_staging(&mut plan);
+            plan.warnings = match std::fs::read_to_string(&warning_board) {
+                Ok(source) => pad_property_warnings(&source, plan.changes.iter().filter_map(|change| match change {
+                    PlannedChange::Update { reference, .. } => Some(reference.as_str()),
+                    PlannedChange::Add { .. } => None,
+                })),
+                Err(error) => vec![conflict(
+                    "pad_property_check_unavailable",
+                    format!(
+                        "the saved board could not be read to check for pad fabrication \
+                         properties the update would drop: {error}"
+                    ),
+                    None,
+                )],
+            };
 
             if dry_run || plan.status == PlanStatus::Conflict {
                 let status = match plan.status {
@@ -628,6 +648,9 @@ fn sync_response(
         },
         "changes": plan.changes,
         "diagnostics": plan.diagnostics,
+        // Not conflicts: what the apply drops because KiCad's IPC API cannot
+        // carry it (pad fabrication properties), so the caller can restore it.
+        "warnings": plan.warnings,
         // Copper-zone nets a pad reassignment touches: refill the zones after
         // the apply, or their fills stay as they were before it.
         "zones_to_refill": plan.zones_to_refill,
@@ -1056,7 +1079,62 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
         unassigned,
         // Set by the handler from the snapshot this plan was made against.
         staging: None,
+        warnings: Vec::new(),
     }
+}
+
+/// Pad fabrication properties (`pad_prop_heatsink`, `pad_prop_mechanical`,
+/// `pad_prop_bga`, …) on the footprints this sync rewrites, as the saved board
+/// has them. KiCad's IPC `Pad` message has no field for them, so a footprint
+/// that passes through an update comes back without them and then differs
+/// from its library copy. The live board cannot report them either, which is
+/// why the saved file is read; a property added in KiCad since the last save
+/// is not seen.
+fn pad_property_warnings<'a>(
+    board_source: &str,
+    references: impl IntoIterator<Item = &'a str>,
+) -> Vec<SyncDiagnostic> {
+    let mut warnings = Vec::new();
+    for reference in references {
+        let needle = format!("(property \"Reference\" \"{reference}\"");
+        let mut from = 0;
+        let mut block = None;
+        while let Some(relative) = board_source[from..].find(&needle) {
+            let at = from + relative;
+            if let Some(found) = konnect_sexp::writer::find_enclosing_block(board_source, "footprint", at) {
+                block = Some(found);
+                break;
+            }
+            from = at + needle.len();
+        }
+        let Some((start, end)) = block else { continue };
+        let text = &board_source[start..end];
+        let mut properties = BTreeSet::new();
+        let mut rest = text;
+        while let Some(index) = rest.find("(property pad_prop_") {
+            let name_start = index + "(property ".len();
+            let name_end = rest[name_start..]
+                .find(|c: char| c == ')' || c.is_whitespace())
+                .map_or(rest.len(), |offset| name_start + offset);
+            properties.insert(rest[name_start..name_end].to_string());
+            rest = &rest[name_end..];
+        }
+        if properties.is_empty() {
+            continue;
+        }
+        let list = properties.into_iter().collect::<Vec<_>>().join(", ");
+        warnings.push(conflict(
+            "pad_fabrication_property_dropped",
+            format!(
+                "{reference} has pads with {list}, which KiCad's IPC API cannot carry; this \
+                 update drops it and {reference} then differs from its library footprint. \
+                 Restore it with KiCad's Tools > Update Footprints from Library on \
+                 {reference} (text and fabrication-attribute options off)."
+            ),
+            Some(reference),
+        ));
+    }
+    warnings
 }
 
 fn conflict(code: &str, message: String, reference: Option<&str>) -> SyncDiagnostic {
@@ -5179,6 +5257,35 @@ mod tests {
         }
     }
 
+    /// KiCad's IPC `Pad` carries no fabrication property, so an update drops
+    /// it: each updated footprint whose saved pads have one is named, and only
+    /// those (a reference is matched whole, so U1 does not pick up U10).
+    #[test]
+    fn pad_fabrication_properties_of_updated_footprints_are_reported() {
+        let board = "(kicad_pcb\n\
+            \t(footprint \"SDO:QFN\"\n\t\t(layer \"F.Cu\")\n\
+            \t\t(property \"Reference\" \"U1\"\n\t\t\t(at 0 0 0)\n\t\t)\n\
+            \t\t(pad \"81\" smd rect\n\t\t\t(at 0 0)\n\t\t\t(size 3.4 3.4)\n\
+            \t\t\t(property pad_prop_heatsink)\n\t\t\t(layers \"F.Cu\")\n\t\t)\n\t)\n\
+            \t(footprint \"Device:R\"\n\t\t(property \"Reference\" \"R1\"\n\t\t\t(at 0 0 0)\n\t\t)\n\
+            \t\t(pad \"1\" smd rect\n\t\t\t(at 0 0)\n\t\t)\n\t)\n\
+            \t(footprint \"Conn:USB\"\n\t\t(property \"Reference\" \"U10\"\n\t\t)\n\
+            \t\t(pad \"SH\" thru_hole oval\n\t\t\t(property pad_prop_mechanical)\n\t\t)\n\
+            \t\t(pad \"SH\" thru_hole oval\n\t\t\t(property pad_prop_mechanical)\n\t\t)\n\t)\n)\n";
+
+        let warnings = pad_property_warnings(board, ["U1", "R1", "U9"]);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(warnings[0].code, "pad_fabrication_property_dropped");
+        assert_eq!(warnings[0].reference.as_deref(), Some("U1"));
+        assert!(warnings[0].message.contains("pad_prop_heatsink"));
+        assert!(!warnings[0].message.contains("mechanical"));
+
+        let usb = pad_property_warnings(board, ["U10"]);
+        assert_eq!(usb.len(), 1);
+        assert!(usb[0].message.contains("pad_prop_mechanical"));
+        assert!(!usb[0].message.contains("mechanical, pad_prop_mechanical"), "listed once");
+    }
+
     fn plan_adding(changes: Vec<PlannedChange>) -> SyncPlan {
         SyncPlan {
             status: PlanStatus::Ready,
@@ -5195,6 +5302,7 @@ mod tests {
             unassigned: Vec::new(),
             zones_to_refill: BTreeSet::new(),
             staging: None,
+            warnings: Vec::new(),
         }
     }
 
