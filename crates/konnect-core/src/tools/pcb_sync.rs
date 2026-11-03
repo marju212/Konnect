@@ -174,11 +174,18 @@ struct PadReach {
     number: String,
     at: Point,
     radius: f64,
+    /// The board layers of a surface pad (SMD or edge connector), so copper
+    /// on another layer cannot count as touching it. `None` for a plated or
+    /// unknown pad, which every copper layer may reach.
+    layers: Option<Vec<i32>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 enum CopperPiece {
-    Segment { a: Point, b: Point, half_width: f64 },
+    /// A track or arc piece; `layer` is its board layer, `None` when unknown
+    /// (then it may touch a pad on any layer).
+    Segment { a: Point, b: Point, half_width: f64, layer: Option<i32> },
+    /// A via: it reaches every copper layer.
     Disc { at: Point, radius: f64 },
 }
 
@@ -204,7 +211,12 @@ impl RoutedCopper {
         };
         pads.iter().any(|pad| {
             pieces.iter().any(|piece| match piece {
-                CopperPiece::Segment { a, b, half_width } => {
+                CopperPiece::Segment { layer: Some(layer), .. }
+                    if pad.layers.as_ref().is_some_and(|layers| !layers.contains(layer)) =>
+                {
+                    false
+                }
+                CopperPiece::Segment { a, b, half_width, .. } => {
                     point_segment_distance(&pad.at, a, b) <= pad.radius + half_width + 0.01
                 }
                 CopperPiece::Disc { at, radius } => {
@@ -2060,7 +2072,7 @@ fn snapshot_board(client: &konnect_ipc::KiCadIpcClient, board: &Path) -> Result<
             record_routed_net(&mut routed_nets, track.net.as_ref());
             if let (Some(net), Some(a), Some(b)) = (net_of(track.net.as_ref()), mm(track.start.as_ref()), mm(track.end.as_ref())) {
                 let half_width = track.width.as_ref().map(|w| konnect_ipc::builders::nm_to_mm(w.value_nm) / 2.0).unwrap_or(0.0);
-                copper.pieces.entry(net).or_default().push(CopperPiece::Segment { a, b, half_width });
+                copper.pieces.entry(net).or_default().push(CopperPiece::Segment { a, b, half_width, layer: Some(track.layer) });
             }
         }
     }
@@ -2073,8 +2085,8 @@ fn snapshot_board(client: &konnect_ipc::KiCadIpcClient, board: &Path) -> Result<
             if let (Some(net), Some(a), Some(m), Some(b)) = (net_of(arc.net.as_ref()), mm(arc.start.as_ref()), mm(arc.mid.as_ref()), mm(arc.end.as_ref())) {
                 let half_width = arc.width.as_ref().map(|w| konnect_ipc::builders::nm_to_mm(w.value_nm) / 2.0).unwrap_or(0.0);
                 let pieces = copper.pieces.entry(net).or_default();
-                pieces.push(CopperPiece::Segment { a: a.clone(), b: m.clone(), half_width });
-                pieces.push(CopperPiece::Segment { a: m, b, half_width });
+                pieces.push(CopperPiece::Segment { a: a.clone(), b: m.clone(), half_width, layer: Some(arc.layer) });
+                pieces.push(CopperPiece::Segment { a: m, b, half_width, layer: Some(arc.layer) });
             }
         }
     }
@@ -2214,6 +2226,13 @@ fn board_footprint_from_instance(
                         .fold(0.0_f64, f64::max)
                 })
                 .unwrap_or(0.0);
+            let surface = pad.r#type == kiapi::board::types::PadType::PtSmd as i32
+                || pad.r#type == kiapi::board::types::PadType::PtEdgeConnector as i32;
+            let layers = pad
+                .pad_stack
+                .as_ref()
+                .map(|stack| stack.layers.clone())
+                .filter(|layers| surface && !layers.is_empty());
             pad_reach.push(PadReach {
                 number: pad.number.clone(),
                 at: Point {
@@ -2221,6 +2240,7 @@ fn board_footprint_from_instance(
                     y: konnect_ipc::builders::nm_to_mm(at.y_nm),
                 },
                 radius,
+                layers,
             });
         }
         if let Some(net) = pad.net.filter(|net| !net.name.is_empty()) {
@@ -3912,8 +3932,8 @@ mod tests {
         };
         let mut footprint = board_resistor("R1", Some("/sheet/existing"));
         footprint.pad_reach = vec![
-            PadReach { number: "1".to_string(), at: Point { x: 0.2, y: 2.0 }, radius: 0.6 },
-            PadReach { number: "2".to_string(), at: Point { x: 1.8, y: 2.0 }, radius: 0.6 },
+            PadReach { number: "1".to_string(), at: Point { x: 0.2, y: 2.0 }, radius: 0.6, layers: None },
+            PadReach { number: "2".to_string(), at: Point { x: 1.8, y: 2.0 }, radius: 0.6, layers: None },
         ];
         let mut board = board_with(vec![footprint]);
         board.routed_nets = BTreeMap::from([("VCC".to_string(), vcc.len())]);
@@ -3932,6 +3952,7 @@ mod tests {
             a: Point { x: 5.0, y: 5.0 },
             b: Point { x: 9.0, y: 5.0 },
             half_width: 0.2,
+            layer: None,
         }];
         let plan = pad_move_plan(far, &[]);
         assert_eq!(plan.status, PlanStatus::Ready, "{:?}", plan.diagnostics);
@@ -3944,10 +3965,51 @@ mod tests {
             a: Point { x: -3.0, y: 2.0 },
             b: Point { x: 0.2, y: 2.0 },
             half_width: 0.2,
+            layer: None,
         }];
         assert_eq!(pad_move_plan(track, &[]).status, PlanStatus::Conflict);
         let via = vec![CopperPiece::Disc { at: Point { x: 0.2, y: 3.0 }, radius: 0.45 }];
         assert_eq!(pad_move_plan(via, &[]).status, PlanStatus::Conflict);
+    }
+
+    #[test]
+    fn copper_on_another_layer_does_not_touch_a_surface_pad() {
+        use konnect_ipc::gen::kiapi::board::types::BoardLayer;
+        let (f_cu, b_cu) = (BoardLayer::BlFCu as i32, BoardLayer::BlBCu as i32);
+        let mut footprint = board_resistor("R1", Some("/sheet/existing"));
+        footprint.pad_reach = vec![PadReach {
+            number: "1".to_string(),
+            at: Point { x: 0.2, y: 2.0 },
+            radius: 0.6,
+            layers: Some(vec![f_cu]),
+        }];
+        let over_the_pad = |layer| CopperPiece::Segment {
+            a: Point { x: -3.0, y: 2.0 },
+            b: Point { x: 3.0, y: 2.0 },
+            half_width: 0.3,
+            layer: Some(layer),
+        };
+        let copper = |pieces| RoutedCopper {
+            pieces: BTreeMap::from([("VCC".to_string(), pieces)]),
+            ..RoutedCopper::default()
+        };
+        // A bottom-layer track under a top-only pad leaves it free to change net.
+        assert!(!copper(vec![over_the_pad(b_cu)]).touches_pad(&footprint, "1", "VCC"));
+        // The same track on the pad's own layer, an arc or track of unknown
+        // layer, and a via (every layer) still touch it.
+        assert!(copper(vec![over_the_pad(f_cu)]).touches_pad(&footprint, "1", "VCC"));
+        let unknown = CopperPiece::Segment {
+            a: Point { x: -3.0, y: 2.0 },
+            b: Point { x: 3.0, y: 2.0 },
+            half_width: 0.3,
+            layer: None,
+        };
+        assert!(copper(vec![unknown]).touches_pad(&footprint, "1", "VCC"));
+        let via = CopperPiece::Disc { at: Point { x: 0.2, y: 2.4 }, radius: 0.3 };
+        assert!(copper(vec![via]).touches_pad(&footprint, "1", "VCC"));
+        // A plated pad (layers unknown) is reached from any layer.
+        footprint.pad_reach[0].layers = None;
+        assert!(copper(vec![over_the_pad(b_cu)]).touches_pad(&footprint, "1", "VCC"));
     }
 
     #[test]
@@ -3965,6 +4027,7 @@ mod tests {
             a: Point { x: -3.0, y: 2.0 },
             b: Point { x: 0.2, y: 2.0 },
             half_width: 0.2,
+            layer: None,
         }];
         let plan = pad_move_plan(track, &["VCC"]);
         assert_eq!(plan.status, PlanStatus::Conflict);
@@ -3989,8 +4052,8 @@ mod tests {
         };
         let mut footprint = board_resistor("R1", Some("/sheet/existing"));
         footprint.pad_reach = vec![
-            PadReach { number: "1".to_string(), at: Point { x: 0.2, y: 2.0 }, radius: 0.6 },
-            PadReach { number: "2".to_string(), at: Point { x: 1.8, y: 2.0 }, radius: 0.6 },
+            PadReach { number: "1".to_string(), at: Point { x: 0.2, y: 2.0 }, radius: 0.6, layers: None },
+            PadReach { number: "2".to_string(), at: Point { x: 1.8, y: 2.0 }, radius: 0.6, layers: None },
         ];
         let mut board = board_with(vec![footprint]);
         board.copper = Some(RoutedCopper {
