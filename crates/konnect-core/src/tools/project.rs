@@ -365,7 +365,7 @@ async fn handle_open_project(
     Ok(CallToolResult::json(&json!({
         "kicad_ui_running": connected,
         "ipc_available": connected,
-        "ipc_address": ctx.config.ipc_address,
+        "ipc_address": konnect_ipc::effective_ipc_address(&ctx.config.ipc_address),
         "ipc_failure": crate::tools::ipc_failure_evidence(&ping),
         "open_board_count": open_boards.len(),
         "open_boards": open_boards,

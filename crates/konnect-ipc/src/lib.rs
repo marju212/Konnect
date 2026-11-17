@@ -15,5 +15,7 @@ pub use client::{
     UnreachableReason,
 };
 pub use endpoint::redact_endpoint;
-pub use socket::{candidate_socket_paths, detect_ipc_address};
+pub use socket::{
+    candidate_socket_paths, detect_ipc_address, effective_ipc_address, enable_late_detection,
+};
 pub use types::*;

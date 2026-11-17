@@ -408,7 +408,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 | `set_predefined_sizes` | Write the PCB editor Pre-defined Sizes list (track widths and via pad/drill pairs) into the sibling `.kicad_pro`. These fill the Track/Via dropdowns; they are not DRC limits. |
 | `get_predefined_sizes` | Return the Pre-defined Sizes list from the sibling `.kicad_pro`, including the 0 / 0,0 netclass sentinel. |
 | `check_kicad_ui` | Check whether the KiCad GUI is running and whether IPC responds within the requested bounded timeout; when it does not, `ipc_failure` names why. |
-| `launch_kicad_ui` | Launch the KiCAD GUI application and optionally open a project file. |
+| `launch_kicad_ui` | Launch the KiCAD GUI application and optionally open a project file. When KiCad is already running nothing is started and the result says already_running: a second instance on an open project stops at a File Open Warning dialog and never serves IPC. |
 | `copy_routing_pattern` | Copy a routing pattern (traces and vias) from one region of the board to another. |
 | `set_layer_constraints` | Set per-layer design constraints (min trace width, clearance) as named rules in the sibling `.kicad_dru` custom-rules file. |
 | `set_custom_rule` | Add, replace or delete one named rule in the sibling `.kicad_dru` custom-rules file, leaving the other rules and comments untouched; the rule text is checked to be one balanced S-expression and the previous text is returned for undo. |

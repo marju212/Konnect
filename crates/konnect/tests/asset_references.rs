@@ -708,6 +708,12 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "match_all",
         "replace_existing",
         "roundrect_rratio",
+        // DRC violation types named in the silkscreen cleanup guidance, and
+        // move_footprint_texts' footprint-frame coordinates; not callable tools.
+        "silk_overlap",
+        "silk_over_copper",
+        "local_x",
+        "local_y",
         // Structured MCP error discriminant, not a callable tool.
         "unsafe_file_fallback",
         "unsupported_capability",

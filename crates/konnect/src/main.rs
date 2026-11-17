@@ -135,6 +135,12 @@ async fn main() -> Result<()> {
 
     info!("Konnect v{} starting", env!("CARGO_PKG_VERSION"));
     ipc_source.log(&config.ipc_address);
+    if config.ipc_address.is_empty() {
+        // Nothing to talk to yet. An MCP client usually starts this server
+        // before the user starts KiCad, so keep looking at each IPC use
+        // instead of staying "not configured" until the client is restarted.
+        konnect_ipc::enable_late_detection();
+    }
 
     // Name the configuration that actually started this process. A user whose
     // settings appear to be ignored otherwise has nothing to go on before the

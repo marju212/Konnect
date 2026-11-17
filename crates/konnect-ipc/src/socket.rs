@@ -57,6 +57,57 @@ pub fn detect_ipc_address() -> Option<String> {
     detect_ipc_address_in(&candidate_socket_paths(), is_adoptable)
 }
 
+/// Whether a client built without an address may look for KiCad's socket
+/// again. Off unless the server turns it on, so a test or an embedder that
+/// passes an empty address keeps getting "not configured" instead of a live
+/// editor it never asked for.
+static LATE_DETECTION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Let an unconfigured address be looked for again at every use.
+///
+/// The server resolves the address once at startup. An MCP client usually
+/// starts the server before the user starts KiCad, and then that one look
+/// finds nothing and the session stays "not configured" until the client is
+/// restarted, with KiCad running and its socket in the default place. The
+/// server calls this when its startup resolution came up empty; an address
+/// that was configured, exported or detected at startup is never replaced.
+pub fn enable_late_detection() {
+    LATE_DETECTION.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The address to dial for a configured one: itself when it is set, and
+/// otherwise, once [`enable_late_detection`] was called, what
+/// `KICAD_API_SOCKET` or [`detect_ipc_address`] gives now. Empty when there is
+/// still nothing, which callers report as "not configured".
+pub fn effective_ipc_address(configured: &str) -> String {
+    effective_ipc_address_with(
+        configured,
+        LATE_DETECTION.load(std::sync::atomic::Ordering::Relaxed),
+        std::env::var("KICAD_API_SOCKET").ok(),
+        detect_ipc_address,
+    )
+}
+
+fn effective_ipc_address_with(
+    configured: &str,
+    late_detection: bool,
+    environment: Option<String>,
+    detect: impl FnOnce() -> Option<String>,
+) -> String {
+    let configured = configured.trim();
+    if !configured.is_empty() {
+        return configured.to_string();
+    }
+    if !late_detection {
+        return String::new();
+    }
+    environment
+        .map(|address| address.trim().to_string())
+        .filter(|address| !address.is_empty())
+        .or_else(detect)
+        .unwrap_or_default()
+}
+
 fn detect_ipc_address_in(
     candidates: &[PathBuf],
     is_adoptable: impl Fn(&Path) -> bool,
@@ -191,6 +242,44 @@ fn format_address(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_configured_address_is_never_replaced() {
+        let address = effective_ipc_address_with(
+            " ipc://configured.sock ",
+            true,
+            Some("ipc://env.sock".to_string()),
+            || Some("ipc://detected.sock".to_string()),
+        );
+        assert_eq!(address, "ipc://configured.sock");
+    }
+
+    #[test]
+    fn an_empty_address_stays_empty_without_late_detection() {
+        let address =
+            effective_ipc_address_with("", false, Some("ipc://env.sock".to_string()), || {
+                panic!("detection must not run when late detection is off")
+            });
+        assert_eq!(address, "");
+    }
+
+    #[test]
+    fn late_detection_finds_a_kicad_started_after_the_server() {
+        // The environment wins over the default path, as at startup.
+        let from_env =
+            effective_ipc_address_with("", true, Some("ipc://env.sock".to_string()), || {
+                Some("ipc://detected.sock".to_string())
+            });
+        assert_eq!(from_env, "ipc://env.sock");
+
+        let detected = effective_ipc_address_with("", true, Some("  ".to_string()), || {
+            Some("ipc://detected.sock".to_string())
+        });
+        assert_eq!(detected, "ipc://detected.sock");
+
+        // Still nothing: the caller reports "not configured" as before.
+        assert_eq!(effective_ipc_address_with("", true, None, || None), "");
+    }
 
     #[test]
     fn candidates_start_with_the_temp_dir_socket() {

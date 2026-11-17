@@ -157,6 +157,10 @@ Step by step (based on the diagnostic guide contributed in
    plugin settings.
 6. Restart the AI client session so it spawns a fresh Konnect process that
    reads the saved settings.
+   A server that found no address at its start (the AI client was opened
+   before KiCad, and nothing is saved or exported) needs no restart for
+   that: it looks for KiCad's socket in the default place again at every
+   IPC use, and finds a KiCad started since.
 7. Verify: have the AI call `open_project`. Expected:
 
    ```json
@@ -479,7 +483,7 @@ callable tools, the fix is to make the *first* listing complete:
 ```
 
 in `konnect.toml` in the working directory, or a `settings.json` beside the binary. Every toolset is then loaded at
-startup, so `tools/list` carries all 235 tools from the first call.
+startup, so `tools/list` carries all 239 tools from the first call.
 
 It is off by default because it costs what the router exists to save: roughly
 25K tokens per listing instead of ~2K. Turn it on only if your client needs it.

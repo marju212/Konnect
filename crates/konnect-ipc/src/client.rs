@@ -1049,11 +1049,18 @@ impl KiCadIpcClient {
     /// directly. Konnect's server resolves the address once at startup — config
     /// file, then the env var, then [`crate::socket::detect_ipc_address`] — and
     /// hands the result in, so an empty path here means that resolution already
-    /// came up empty.
+    /// came up empty. A server whose startup resolution came up empty turns on
+    /// [`crate::socket::enable_late_detection`], and then an empty path is
+    /// looked for again here: KiCad may have been started since.
     pub fn new(socket_path: impl Into<String>) -> Self {
         let path = socket_path.into();
         let effective_path = if path.is_empty() {
-            std::env::var("KICAD_API_SOCKET").unwrap_or_default()
+            let from_env = std::env::var("KICAD_API_SOCKET").unwrap_or_default();
+            if from_env.is_empty() {
+                crate::socket::effective_ipc_address("")
+            } else {
+                from_env
+            }
         } else {
             path
         };

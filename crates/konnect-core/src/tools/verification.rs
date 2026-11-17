@@ -145,11 +145,16 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "launch_kicad_ui",
-            "Launch the KiCAD GUI application and optionally open a project file.",
+            "Launch the KiCAD GUI application and optionally open a project file. When KiCad is already running nothing is started and the result says already_running: a second instance on an open project stops at a File Open Warning dialog and never serves IPC.",
             json!({
                 "type": "object",
                 "properties": {
                     "project": { "type": "string", "description": "Path to .kicad_pro file to open (optional)" },
+                    "allow_second_instance": {
+                        "type": "boolean",
+                        "description": "Start KiCad even though one is already running",
+                        "default": false
+                    },
                     "wait_ready": {
                         "type": "boolean",
                         "description": "Wait until KiCAD IPC is responsive before returning",
@@ -911,6 +916,35 @@ async fn handle_launch_kicad_ui(
     let wait_ready = args["wait_ready"].as_bool().unwrap_or(true);
     let timeout_secs = args["timeout_seconds"].as_u64().unwrap_or(30);
     let binary = find_kicad_binary(&ctx.config.kicad_binary, &ctx.config.kicad_cli);
+
+    // A second KiCad on a project that is already open stops at a "File Open
+    // Warning" dialog and never serves IPC: the caller waits out its timeout
+    // while a modal sits on the user's screen. Report the running instance
+    // instead, unless the caller asks for another one.
+    let allow_second_instance = args["allow_second_instance"].as_bool().unwrap_or(false);
+    if !allow_second_instance
+        && task::spawn_blocking(is_kicad_running)
+            .await
+            .unwrap_or(false)
+    {
+        let addr = ctx.config.ipc_address.clone();
+        let ipc_ready = task::spawn_blocking(move || {
+            konnect_ipc::client::KiCadIpcClient::new(&addr)
+                .ping()
+                .unwrap_or(false)
+        })
+        .await
+        .unwrap_or(false);
+        return Ok(CallToolResult::json(&json!({
+            "launched": false,
+            "already_running": true,
+            "ipc_ready": ipc_ready,
+            "note": "KiCad is already running, so no second instance was started. \
+                     Use the running one (open_project lists the boards it has open; \
+                     the PCB editor is opened from its project manager), or pass \
+                     allow_second_instance: true."
+        })));
+    }
 
     let mut cmd = tokio::process::Command::new(&binary);
     if let Some(project) = args["project"].as_str() {
