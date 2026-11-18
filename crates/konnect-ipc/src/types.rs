@@ -522,6 +522,10 @@ pub struct IpcFootprintText {
     pub angle: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<IpcVector2>,
+    /// Stroke width in mm as KiCad holds it. `0` means none is set and KiCad
+    /// draws the text at its default stroke for the size.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thickness: Option<f64>,
     pub visible: bool,
 }
 
@@ -547,6 +551,24 @@ pub struct IpcFootprintTextEdit {
     pub angle: Option<f64>,
     pub layer: Option<String>,
     pub visible: Option<bool>,
+    /// Text height and width in mm; one value sets both.
+    #[serde(default)]
+    pub size: Option<f64>,
+    /// Stroke width in mm.
+    #[serde(default)]
+    pub thickness: Option<f64>,
+}
+
+/// The solder-mask margin of one pad of a placed footprint, as KiCad holds
+/// it. `None` means the pad carries no override of its own and takes the
+/// margin from the footprint or the board's design rules.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IpcPadMaskMargin {
+    pub number: String,
+    pub margin: Option<f64>,
+    /// The back outer layers' margin. KiCad keeps one margin for both sides;
+    /// it is reported separately so a mismatch would be visible.
+    pub back_margin: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

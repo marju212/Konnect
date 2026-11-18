@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **21 toolsets** organized into 10 categories
-- **232 registered tools** + **7 always-visible meta-tools** = **239 total**
+- **233 registered tools** + **7 always-visible meta-tools** = **240 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -232,8 +232,8 @@ and Windows servers do not.
 
 ## PCB
 
-### `pcb_board` · 16 tools
-**Purpose:** Board outline, layers, physical stackup, zones, mounting holes, board text, footprint texts, SVG logo import.
+### `pcb_board` · 17 tools
+**Purpose:** Board outline, layers, physical stackup, zones, mounting holes, board text, footprint texts, placed pads' solder-mask margin, SVG logo import.
 **Source:** [`crates/konnect-core/src/tools/pcb_board.rs`](crates/konnect-core/src/tools/pcb_board.rs)
 
 | Tool | Description |
@@ -252,8 +252,9 @@ and Windows servers do not.
 | `add_zone` | Add a copper fill zone polygon on a specified layer and net, with optional `name`, `priority` and `pad_connection` (`solid`/`thermal`/`none`). Tries KiCad IPC first — a live board gets the zone through the API and a refill, so it appears immediately and is undoable — and falls back to an S-expression file insert only when no live KiCad answers, reporting `source` and a `warning` when it does. Refuses a net the board does not declare rather than binding copper to net 0, and refuses outright if KiCad answers but rejects the request. |
 | `delete_zone` | Delete one zone (pour, keepout or rule area) by UUID or unique name from the board KiCad holds open; a shared name is refused with the candidates. Verified by read-back; returns name, net, layers and priority. Does not refill. |
 | `import_svg_logo` | Import an SVG file as filled silkscreen/copper artwork (curves flattened to polygons). |
-| `list_board_footprint_texts` | List the texts of placed footprints — reference, value, custom fields and plain texts — with layer, absolute board and footprint-local position, angle, size and visibility. Requires KiCAD running with the board open. |
-| `move_footprint_texts` | Move, rotate, re-layer or hide footprint texts (reference designators, values, custom fields, plain texts) without moving the footprints: absolute, relative or footprint-local positions, checked first and sent as one undo step. Requires KiCAD running with the board open. |
+| `list_board_footprint_texts` | List the texts of placed footprints — reference, value, custom fields and plain texts — with layer, absolute board and footprint-local position, angle, size, stroke thickness and visibility. Requires KiCAD running with the board open. |
+| `move_footprint_texts` | Move, rotate, re-layer, hide or resize footprint texts (reference designators, values, custom fields, plain texts) without moving the footprints: absolute, relative or footprint-local positions, text `size` and stroke `thickness` in mm (a move may change only those), checked first and sent as one undo step. Requires KiCAD running with the board open. |
+| `set_placed_pad_mask_margin` | Set the solder-mask margin of a placed footprint's pads (all, or the numbers in `pads`) live, front and back, from -1 to 2 mm; unknown pad numbers are refused before anything is sent, the mask mode is left as it is, and the result is each pad's margin as KiCad reads it back. One undo step. Requires KiCAD running with the board open. |
 
 ### `pcb_components` · 20 tools
 **Purpose:** Place, refresh, move, rotate, flip, align, duplicate and repair PCB footprints; inspect pads; inspect and edit a placed footprint's graphics and 3D models.

@@ -3433,6 +3433,54 @@ impl KiCadIpcClient {
         Ok(results)
     }
 
+    /// Set the solder-mask margin of pads of the placed footprint
+    /// `reference`: the pads numbered in `numbers`, every pad when empty.
+    /// Unknown pad numbers and out-of-range margins are refused before
+    /// anything is sent; the footprint goes to KiCad in one `UpdateItems`
+    /// (one undo step). Returns the edited pads' margins as KiCad reports
+    /// them when the footprint is read again afterwards, not as requested.
+    /// See [`crate::footprint_pad`].
+    pub fn set_footprint_pad_mask_margin(
+        &self,
+        reference: &str,
+        numbers: &[String],
+        margin_mm: f64,
+    ) -> Result<Vec<IpcPadMaskMargin>> {
+        let mut fp = self.unique_footprint_instance(reference)?;
+        let edited = crate::footprint_pad::set_pad_mask_margin(&mut fp, numbers, margin_mm)?;
+        self.update_items(vec![pack_any(&fp, "kiapi.board.types.FootprintInstance")])?;
+
+        let after = self
+            .unique_footprint_instance(reference)
+            .context("the footprint was sent to KiCad but could not be read back")?;
+        let wanted: BTreeSet<&str> = edited.iter().map(|p| p.number.as_str()).collect();
+        Ok(crate::footprint_pad::pad_mask_margins(&after)
+            .into_iter()
+            .filter(|p| wanted.contains(p.number.as_str()))
+            .collect())
+    }
+
+    /// The one placed footprint carrying `reference`; refuses a reference
+    /// that names none or more than one.
+    fn unique_footprint_instance(
+        &self,
+        reference: &str,
+    ) -> Result<kiapi::board::types::FootprintInstance> {
+        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
+        let mut matches = items.iter().filter_map(|item| {
+            kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+                .ok()
+                .filter(|fp| crate::footprint_text::reference_of(fp) == reference)
+        });
+        let fp = matches
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("Footprint '{}' not found", reference))?;
+        if matches.next().is_some() {
+            anyhow::bail!("more than one footprint is called '{}'", reference);
+        }
+        Ok(fp)
+    }
+
     /// The placed footprint carrying `reference`, and its index among items.
     fn find_footprint_instance(
         &self,

@@ -91,6 +91,9 @@ fn describe(
             x: nm_to_mm(s.x_nm),
             y: nm_to_mm(s.y_nm),
         }),
+        thickness: attrs
+            .and_then(|a| a.stroke_width)
+            .map(|w| nm_to_mm(w.value_nm)),
         visible,
     }
 }
@@ -153,6 +156,11 @@ fn field_matches(name: &str, field_name: &str) -> bool {
     field_name.eq_ignore_ascii_case(&want)
 }
 
+/// The largest text height/width an edit may set, in mm.
+pub const MAX_TEXT_SIZE_MM: f64 = 10.0;
+/// The largest text stroke width an edit may set, in mm.
+pub const MAX_TEXT_THICKNESS_MM: f64 = 2.0;
+
 /// Rewrite one text in place. Refusals happen before any mutation.
 fn apply_to_text(
     bt: &mut BoardText,
@@ -167,6 +175,18 @@ fn apply_to_text(
     };
     if edit.visible.is_some() && visible.is_none() {
         anyhow::bail!("a plain footprint text has no visibility flag; only fields can be hidden");
+    }
+    if let Some(size) = edit.size {
+        if !(size.is_finite() && size > 0.0 && size <= MAX_TEXT_SIZE_MM) {
+            anyhow::bail!("text size {size} mm is outside (0, {MAX_TEXT_SIZE_MM}] mm");
+        }
+    }
+    if let Some(thickness) = edit.thickness {
+        if !(thickness.is_finite() && thickness > 0.0 && thickness <= MAX_TEXT_THICKNESS_MM) {
+            anyhow::bail!(
+                "text thickness {thickness} mm is outside (0, {MAX_TEXT_THICKNESS_MM}] mm"
+            );
+        }
     }
 
     let text = bt.text.get_or_insert_with(Default::default);
@@ -197,6 +217,18 @@ fn apply_to_text(
             Some(kiapi::common::types::Angle {
                 value_degrees: angle,
             });
+    }
+    if let Some(size) = edit.size {
+        let nm = mm_to_nm(size);
+        text.attributes.get_or_insert_with(Default::default).size =
+            Some(kiapi::common::types::Vector2 { x_nm: nm, y_nm: nm });
+    }
+    if let Some(thickness) = edit.thickness {
+        text.attributes
+            .get_or_insert_with(Default::default)
+            .stroke_width = Some(kiapi::common::types::Distance {
+            value_nm: mm_to_nm(thickness),
+        });
     }
     if let Some(layer) = layer {
         bt.layer = layer;
@@ -363,6 +395,8 @@ mod tests {
             angle: None,
             layer: None,
             visible: None,
+            size: None,
+            thickness: None,
         }
     }
 
@@ -462,6 +496,31 @@ mod tests {
     }
 
     #[test]
+    fn size_and_thickness_are_written_without_moving_the_text() {
+        let mut fp = footprint(10.0, 20.0, 0.0);
+        let before = list_texts(&fp)[0].clone();
+        assert_eq!(before.thickness, None);
+        let mut e = edit(IpcTextTarget::Field("Reference".to_string()));
+        e.size = Some(0.8);
+        e.thickness = Some(0.15);
+        let after = apply_edit(&mut fp, &e).unwrap();
+        let size = after.size.as_ref().expect("size");
+        assert!(close(size.x, 0.8) && close(size.y, 0.8), "{size:?}");
+        assert!(close(after.thickness.expect("thickness"), 0.15));
+        assert!(close(after.position.x, before.position.x));
+        assert!(close(after.position.y, before.position.y));
+        // The listing reads the same attributes back.
+        let listed = &list_texts(&fp)[0];
+        assert!(close(listed.thickness.unwrap(), 0.15));
+        assert!(close(listed.size.as_ref().unwrap().x, 0.8));
+        // A custom field and a plain text take the same edit.
+        let mut e = edit(IpcTextTarget::Uuid("u-1".to_string()));
+        e.thickness = Some(0.1);
+        let plain = apply_edit(&mut fp, &e).unwrap();
+        assert!(close(plain.thickness.unwrap(), 0.1));
+    }
+
+    #[test]
     fn plain_text_is_addressed_by_uuid() {
         let mut fp = footprint(10.0, 20.0, 0.0);
         let mut e = edit(IpcTextTarget::Uuid("u-1".to_string()));
@@ -483,7 +542,30 @@ mod tests {
             hide_plain.visible = Some(false);
             let missing = edit(IpcTextTarget::Field("MPN".to_string()));
             let missing_uuid = edit(IpcTextTarget::Uuid("nope".to_string()));
-            vec![two_modes, bad_layer, hide_plain, missing, missing_uuid]
+            let mut zero_size = edit(IpcTextTarget::Field("Reference".to_string()));
+            zero_size.size = Some(0.0);
+            let mut huge_size = edit(IpcTextTarget::Field("Reference".to_string()));
+            huge_size.size = Some(10.5);
+            let mut negative_thickness = edit(IpcTextTarget::Field("Value".to_string()));
+            negative_thickness.thickness = Some(-0.1);
+            let mut thick = edit(IpcTextTarget::Uuid("u-1".to_string()));
+            thick.thickness = Some(2.5);
+            // A valid size with a refused thickness must not half-apply.
+            let mut half = edit(IpcTextTarget::Field("Reference".to_string()));
+            half.size = Some(1.0);
+            half.thickness = Some(f64::NAN);
+            vec![
+                two_modes,
+                bad_layer,
+                hide_plain,
+                missing,
+                missing_uuid,
+                zero_size,
+                huge_size,
+                negative_thickness,
+                thick,
+                half,
+            ]
         };
         for e in cases {
             let mut fp = original.clone();

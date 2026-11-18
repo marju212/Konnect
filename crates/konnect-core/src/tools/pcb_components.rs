@@ -1887,7 +1887,7 @@ pub fn footprint_text_tools() -> Vec<ToolDef> {
     vec![
         tool!(
             "list_board_footprint_texts",
-            "List the texts of footprints placed on the board: the reference and value fields, custom fields such as LCSC, and plain text items. Each reports its field name (or UUID for a plain text), text, layer, absolute board 'position' in mm (the coordinates DRC and KiCad's properties dialog use), footprint-local 'local' mm (as the .kicad_mod shows them), absolute 'angle', 'size' and 'visible'. Use it with run_drc's silk_overlap / silk_over_copper locations to decide where move_footprint_texts should put a reference. Requires KiCAD running with the board open.",
+            "List the texts of footprints placed on the board: the reference and value fields, custom fields such as LCSC, and plain text items. Each reports its field name (or UUID for a plain text), text, layer, absolute board 'position' in mm (the coordinates DRC and KiCad's properties dialog use), footprint-local 'local' mm (as the .kicad_mod shows them), absolute 'angle', 'size', 'thickness' (stroke width in mm; 0 means none is set and KiCad uses its default for the size) and 'visible'. Use it with run_drc's silk_overlap / silk_over_copper locations to decide where move_footprint_texts should put a reference. Requires KiCAD running with the board open.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1903,7 +1903,7 @@ pub fn footprint_text_tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "move_footprint_texts",
-            "Move, rotate, re-layer or hide texts of footprints placed on the board (reference designators, values, custom fields, plain texts) without moving the footprints. Each move names a footprint and a field ('Reference', 'Value', a custom field name; 'ref'/'val' work) or the UUID of a plain text, then at most one of: x/y (absolute board mm), dx/dy (board mm from where the text is now) or local_x/local_y (footprint-local mm, follows the part's rotation); plus optional angle (absolute board degrees), layer and visible. Every move is checked first and the whole batch is sent as one KiCad edit (one undo step); a refused move sends nothing. Save with save_project afterwards. Requires KiCAD running with the board open.",
+            "Move, rotate, re-layer or hide texts of footprints placed on the board (reference designators, values, custom fields, plain texts) without moving the footprints. Each move names a footprint and a field ('Reference', 'Value', a custom field name; 'ref'/'val' work) or the UUID of a plain text, then at most one of: x/y (absolute board mm), dx/dy (board mm from where the text is now) or local_x/local_y (footprint-local mm, follows the part's rotation); plus optional angle (absolute board degrees), layer, visible, size (text height and width in mm, one value sets both) and thickness (stroke width in mm). A move may change only size and thickness and leave the text where it is. Every move is checked first and the whole batch is sent as one KiCad edit (one undo step); a refused move sends nothing. Save with save_project afterwards. Requires KiCAD running with the board open.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1925,7 +1925,9 @@ pub fn footprint_text_tools() -> Vec<ToolDef> {
                                 "local_y":   { "type": "number" },
                                 "angle":     { "type": "number", "description": "Absolute text angle in degrees" },
                                 "layer":     { "type": "string", "description": "e.g. 'F.SilkS', 'F.Fab'" },
-                                "visible":   { "type": "boolean", "description": "Fields only" }
+                                "visible":   { "type": "boolean", "description": "Fields only" },
+                                "size":      { "type": "number", "exclusiveMinimum": 0, "maximum": 10, "description": "Text height and width in mm (one value sets both), > 0 and <= 10" },
+                                "thickness": { "type": "number", "exclusiveMinimum": 0, "maximum": 2, "description": "Text stroke width in mm, > 0 and <= 2" }
                             },
                             "required": ["reference"]
                         }
@@ -1937,6 +1939,32 @@ pub fn footprint_text_tools() -> Vec<ToolDef> {
         )
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
     ]
+}
+
+/// Pad edits of a placed footprint. Listed in `pcb_board` beside the
+/// footprint-text tools for the same reason: `pcb_components` is at the
+/// per-toolset cap.
+pub fn placed_pad_tools() -> Vec<ToolDef> {
+    vec![tool!(
+        "set_placed_pad_mask_margin",
+        "Set the solder-mask margin (expansion) of pads of a footprint placed on the board, live in KiCad, without re-placing the part: every pad of the footprint, or only the pads named in 'pads'. The margin is in mm, from -1 to 2 (0 and negative contractions are allowed), and is written to the pad's front and back outer layers, since KiCad keeps one margin for both; the pads' mask mode is left as it is. Unknown pad numbers are refused before anything is sent, and the edit is one KiCad undo step. Returns each edited pad's number and its margin as KiCad reports it afterwards. Save with save_project afterwards. Requires KiCAD running with the board open.",
+        json!({
+            "type": "object",
+            "properties": {
+                "board":     { "type": "string" },
+                "reference": { "type": "string", "description": "Reference designator of the placed footprint, e.g. 'FID1'" },
+                "pads": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Pad numbers to edit (optional; default every pad of the footprint). A fiducial's pad often has the empty number \"\"."
+                },
+                "margin": { "type": "number", "minimum": -1, "maximum": 2, "description": "Solder-mask margin in mm, from -1 to 2" }
+            },
+            "required": ["board", "reference", "margin"]
+        }),
+        |args, ctx| async move { handle_set_placed_pad_mask_margin(args, ctx).await }
+    )
+    .with_board_access(crate::tools::BoardAccess::LiveOnly)]
 }
 
 pub fn tools() -> Vec<ToolDef> {
@@ -2610,6 +2638,14 @@ fn parse_text_moves(
                     .ok_or_else(|| invalid(format!("entry {i}: 'visible' is not a boolean")))?,
             ),
         };
+        let bounded = |key: &str, max: f64| -> Result<Option<f64>, CallToolResult> {
+            match num(key)? {
+                Some(v) if !(v > 0.0 && v <= max) => Err(invalid(format!(
+                    "entry {i}: '{key}' must be greater than 0 and at most {max} mm, got {v}"
+                ))),
+                other => Ok(other),
+            }
+        };
         let edit = IpcFootprintTextEdit {
             reference: reference.to_string(),
             target,
@@ -2622,6 +2658,11 @@ fn parse_text_moves(
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
             visible,
+            size: bounded("size", konnect_ipc::footprint_text::MAX_TEXT_SIZE_MM)?,
+            thickness: bounded(
+                "thickness",
+                konnect_ipc::footprint_text::MAX_TEXT_THICKNESS_MM,
+            )?,
         };
         let modes = [edit.position, edit.offset, edit.local]
             .iter()
@@ -2653,6 +2694,101 @@ async fn handle_move_footprint_texts(
         "saved": false,
         "next": "save_project to write the board file",
     })))
+}
+
+/// The arguments of `set_placed_pad_mask_margin` other than `board`.
+#[derive(Debug, PartialEq)]
+struct PadMaskMarginArgs {
+    reference: String,
+    pads: Vec<String>,
+    margin: f64,
+}
+
+fn parse_pad_mask_margin_args(
+    args: &serde_json::Value,
+) -> Result<PadMaskMarginArgs, CallToolResult> {
+    use konnect_ipc::footprint_pad::{MAX_PAD_MASK_MARGIN_MM, MIN_PAD_MASK_MARGIN_MM};
+    let reference = require_str(args, "reference")?.to_string();
+    let margin = require_f64(args, "margin")?;
+    if !(MIN_PAD_MASK_MARGIN_MM..=MAX_PAD_MASK_MARGIN_MM).contains(&margin) {
+        return Err(crate::tools::invalid_arg(
+            "margin",
+            &format!(
+                "must be from {MIN_PAD_MASK_MARGIN_MM} to {MAX_PAD_MASK_MARGIN_MM} mm, got {margin}"
+            ),
+        ));
+    }
+    let pads = match &args["pads"] {
+        serde_json::Value::Null => Vec::new(),
+        serde_json::Value::Array(items) => {
+            if items.is_empty() {
+                return Err(crate::tools::invalid_arg(
+                    "pads",
+                    "is empty; leave it out to edit every pad",
+                ));
+            }
+            let mut out = Vec::with_capacity(items.len());
+            for (i, item) in items.iter().enumerate() {
+                match item.as_str() {
+                    Some(n) => out.push(n.to_string()),
+                    None => {
+                        return Err(crate::tools::invalid_arg(
+                            "pads",
+                            &format!("entry {i} is not a string"),
+                        ))
+                    }
+                }
+            }
+            out
+        }
+        _ => {
+            return Err(crate::tools::invalid_arg(
+                "pads",
+                "must be an array of pad numbers",
+            ))
+        }
+    };
+    Ok(PadMaskMarginArgs {
+        reference,
+        pads,
+        margin,
+    })
+}
+
+async fn handle_set_placed_pad_mask_margin(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let parsed = match parse_pad_mask_margin_args(args) {
+        Ok(p) => p,
+        Err(e) => return Ok(e),
+    };
+    let (reference, pads, margin) = (parsed.reference.clone(), parsed.pads.clone(), parsed.margin);
+    let after: Vec<konnect_ipc::types::IpcPadMaskMargin> = ipc!(ctx, args, |c| c
+        .set_footprint_pad_mask_margin(&reference, &pads, margin));
+
+    // KiCad's readback, not the request, decides whether the edit took.
+    let applied = |m: Option<f64>| m.is_some_and(|m| (m - margin).abs() < 1e-6);
+    let mismatched: Vec<_> = after
+        .iter()
+        .filter(|p| !(applied(p.margin) && applied(p.back_margin)))
+        .map(|p| p.number.clone())
+        .collect();
+    let body = json!({
+        "reference": parsed.reference,
+        "margin": margin,
+        "pads": after,
+        "saved": false,
+        "next": "save_project to write the board file",
+    });
+    if after.is_empty() || !mismatched.is_empty() {
+        return Ok(CallToolResult::error(format!(
+            "KiCad accepted the edit of '{}', but reading the footprint back does not show a \
+             {margin} mm margin on pad(s) {:?}; inspect the board before retrying. Readback: {}",
+            parsed.reference, mismatched, body
+        )));
+    }
+    Ok(CallToolResult::json(&body))
 }
 
 async fn handle_rotate_component(
@@ -7496,9 +7632,17 @@ mod board_footprint_graphics_tests {
         let moves = parse_text_moves(&json!([
             { "reference": "R1", "x": 1, "y": 2 },
             { "reference": "R2", "field": "Value", "dx": 0.5, "dy": 0 },
-            { "reference": "R3", "uuid": "u-1", "local_x": 0, "local_y": -1.5, "angle": 90, "visible": true }
+            { "reference": "R3", "uuid": "u-1", "local_x": 0, "local_y": -1.5, "angle": 90, "visible": true },
+            { "reference": "R4", "size": 1, "thickness": 0.15 }
         ]))
         .expect("valid");
+        assert_eq!(moves[3].size, Some(1.0));
+        assert_eq!(moves[3].thickness, Some(0.15));
+        assert_eq!(moves[3].position, None);
+        assert_eq!(moves[3].offset, None);
+        assert_eq!(moves[3].local, None);
+        assert_eq!(moves[0].size, None);
+        assert_eq!(moves[0].thickness, None);
         assert_eq!(
             moves[0].target,
             IpcTextTarget::Field("Reference".to_string())
@@ -7523,6 +7667,13 @@ mod board_footprint_graphics_tests {
             json!([{ "reference": "R1", "field": "Value", "uuid": "u" }]),
             json!([{ "reference": "R1", "angle": "ninety" }]),
             json!([{ "reference": "R1", "visible": "no" }]),
+            json!([{ "reference": "R1", "size": 0 }]),
+            json!([{ "reference": "R1", "size": -1 }]),
+            json!([{ "reference": "R1", "size": 10.5 }]),
+            json!([{ "reference": "R1", "size": "1mm" }]),
+            json!([{ "reference": "R1", "thickness": 0 }]),
+            json!([{ "reference": "R1", "thickness": 2.5 }]),
+            json!([{ "reference": "R1", "thickness": true }]),
         ] {
             let err = parse_text_moves(&bad).expect_err(&format!("{bad} should be refused"));
             assert!(err.is_error, "{bad}");
@@ -7547,6 +7698,70 @@ mod board_footprint_graphics_tests {
                 .filter_map(|v| v.as_str())
                 .collect();
             assert_eq!(got, required, "{name} required arguments");
+        }
+    }
+
+    #[test]
+    fn pad_mask_margin_arguments_parse() {
+        let all = parse_pad_mask_margin_args(&json!({
+            "board": "b.kicad_pcb", "reference": "FID1", "margin": 0.5
+        }))
+        .expect("valid");
+        assert_eq!(
+            all,
+            PadMaskMarginArgs {
+                reference: "FID1".to_string(),
+                pads: vec![],
+                margin: 0.5
+            }
+        );
+        let some = parse_pad_mask_margin_args(&json!({
+            "board": "b.kicad_pcb", "reference": "U1", "pads": ["1", ""], "margin": -1
+        }))
+        .expect("valid");
+        assert_eq!(some.pads, vec!["1".to_string(), String::new()]);
+        assert_eq!(some.margin, -1.0);
+        let zero = parse_pad_mask_margin_args(&json!({
+            "board": "b", "reference": "U1", "margin": 0
+        }))
+        .expect("valid");
+        assert_eq!(zero.margin, 0.0);
+    }
+
+    #[test]
+    fn malformed_pad_mask_margin_arguments_are_refused() {
+        for bad in [
+            json!({ "board": "b", "margin": 0.5 }),
+            json!({ "board": "b", "reference": "FID1" }),
+            json!({ "board": "b", "reference": "FID1", "margin": "0.5" }),
+            json!({ "board": "b", "reference": "FID1", "margin": 2.5 }),
+            json!({ "board": "b", "reference": "FID1", "margin": -1.01 }),
+            json!({ "board": "b", "reference": "FID1", "margin": 0.5, "pads": [] }),
+            json!({ "board": "b", "reference": "FID1", "margin": 0.5, "pads": "1" }),
+            json!({ "board": "b", "reference": "FID1", "margin": 0.5, "pads": [1] }),
+        ] {
+            let err =
+                parse_pad_mask_margin_args(&bad).expect_err(&format!("{bad} should be refused"));
+            assert!(err.is_error, "{bad}");
+        }
+    }
+
+    #[test]
+    fn pad_mask_margin_tool_is_registered_with_the_arguments_it_reads() {
+        let tools = crate::tools::pcb_board::tools();
+        let def = tools
+            .iter()
+            .find(|t| t.name == "set_placed_pad_mask_margin")
+            .expect("set_placed_pad_mask_margin is not registered in pcb_board");
+        let required: Vec<&str> = def.input_schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(required, vec!["board", "reference", "margin"]);
+        for key in ["board", "reference", "pads", "margin"] {
+            assert!(def.input_schema["properties"][key].is_object(), "{key}");
         }
     }
 

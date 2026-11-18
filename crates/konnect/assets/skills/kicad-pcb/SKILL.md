@@ -237,7 +237,11 @@ an unproved outline is not completion evidence.
   `silk_over_copper` at board coordinates; `list_board_footprint_texts` gives
   each reference's position and size; `move_footprint_texts` moves them in one
   batch (`local_x`/`local_y` follow the part's rotation, `layer: "F.Fab"` or
-  `visible: false` takes a text off the silkscreen). Save, then re-run DRC.
+  `visible: false` takes a text off the silkscreen). The same moves set a
+  text's size and stroke thickness in mm, with or without moving it. Save,
+  then re-run DRC.
+- A placed pad's solder-mask expansion (a fiducial's mask opening, say) is
+  set live with `set_placed_pad_mask_margin`, front and back at once.
 
 ---
 
