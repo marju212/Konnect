@@ -1199,15 +1199,24 @@ fn pad_missing_conflict(reference: &str, footprint_id: &str, missing: &[&str]) -
     )
 }
 
+/// KiCad names the net of a pin that connects to nothing
+/// `unconnected-(REF-Pin-PadN)`. Such a pin needs no pad: KiCad's own
+/// "Update PCB from Schematic" only warns when the footprint lacks it (a
+/// keyed header with a pin left out, for example).
+fn is_unconnected_placeholder(net: &str) -> bool {
+    net.starts_with("unconnected-(")
+}
+
 /// Pad numbers the schematic connects that `available` does not contain.
+/// A pin on KiCad's single-pin placeholder net is not a connection.
 fn missing_pads<'a>(
     pad_nets: &'a BTreeMap<String, String>,
     available: &BTreeSet<String>,
 ) -> Vec<&'a str> {
     pad_nets
-        .keys()
-        .filter(|number| !available.contains(*number))
-        .map(String::as_str)
+        .iter()
+        .filter(|(number, net)| !available.contains(*number) && !is_unconnected_placeholder(net))
+        .map(|(number, _)| number.as_str())
         .collect()
 }
 
@@ -1598,8 +1607,8 @@ fn apply_footprint_fields(
             });
         *child = konnect_ipc::builders::pack_any(&pad, "kiapi.board.types.Pad");
     }
-    for number in pad_nets.keys() {
-        if !seen_pads.contains(number) {
+    for (number, net) in pad_nets {
+        if !seen_pads.contains(number) && !is_unconnected_placeholder(net) {
             bail!("footprint {reference} has no pad {number}");
         }
     }
@@ -5462,6 +5471,22 @@ mod tests {
             Some("Resistor_SMD:R_0603_1608Metric")
         );
         assert!(missing.message.contains("pad 3"), "{}", missing.message);
+    }
+
+    /// A keyed header leaves a pin out of its footprint; the schematic's pin
+    /// sits on KiCad's single-pin placeholder net and is not a connection,
+    /// while a real net on a missing pad still is.
+    #[test]
+    fn an_unconnected_pin_without_a_pad_is_not_a_missing_pad() {
+        let pad_nets = BTreeMap::from([
+            ("1".to_string(), "USB_VBUS".to_string()),
+            ("9".to_string(), "unconnected-(J401-Pin_9-Pad9)".to_string()),
+            ("11".to_string(), "GND".to_string()),
+        ]);
+        let available = BTreeSet::from(["1".to_string(), "10".to_string()]);
+        assert_eq!(missing_pads(&pad_nets, &available), vec!["11"]);
+        assert!(is_unconnected_placeholder("unconnected-(J401-Pin_9-Pad9)"));
+        assert!(!is_unconnected_placeholder("/USB/CONN_DP"));
     }
 
     /// The pad set is every pad KiCad sent, netted or not. The 0402 from the
